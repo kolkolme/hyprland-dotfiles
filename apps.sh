@@ -7,6 +7,12 @@ say()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  •\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m [!]\033[0m %s\n' "$*"; }
 
+# Никаких диалогов, ждущих ответа в тишине
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+LOG="${LOG:-$HOME/.dotfiles-apps.log}"
+: > "$LOG"
+
 OPT="$HOME/.local/opt"
 BIN="$HOME/.local/bin"
 APPS="$HOME/.local/share/applications"
@@ -17,7 +23,7 @@ FAILED=()
 
 # ─────────────────────────────────────────────── C++
 say "C++: компилятор и инструменты"
-if sudo apt-get install -y build-essential g++ gdb cmake make pkg-config >/dev/null 2>&1; then
+if sudo -E apt-get install -y build-essential g++ gdb cmake make pkg-config >>"$LOG" 2>&1; then
     ok "g++ $(g++ -dumpversion 2>/dev/null), gdb, cmake, make"
 else
     warn "не удалось"; FAILED+=("C++")
@@ -38,8 +44,8 @@ Components: main
 Architectures: amd64
 Signed-By: /etc/apt/keyrings/microsoft.gpg
 EOF
-    sudo apt-get update >/dev/null 2>&1
-    if sudo apt-get install -y code >/dev/null 2>&1; then
+    sudo -E apt-get update >>"$LOG" 2>&1
+    if sudo -E apt-get install -y code >>"$LOG" 2>&1; then
         ok "поставлен из репозитория Microsoft"
     else
         warn "репозиторий добавлен, но пакет не встал"; FAILED+=("VS Code")
@@ -56,11 +62,15 @@ else
     # Steam 32-битный, без архитектуры i386 не поставится
     dpkg --print-foreign-architectures | grep -qx i386 || {
         sudo dpkg --add-architecture i386 && ok "включил архитектуру i386"
-        sudo apt-get update >/dev/null 2>&1
+        sudo -E apt-get update >>"$LOG" 2>&1
     }
     grep -rqi 'non-free' /etc/apt/sources.list.d/ /etc/apt/sources.list 2>/dev/null \
         || warn "в репозиториях нет non-free — Steam может не найтись"
-    if sudo apt-get install -y steam-installer >/dev/null 2>&1; then
+    # Steam показывает лицензию и ждёт согласия — отвечаем заранее,
+    # иначе установка встаёт на невидимом диалоге
+    printf 'steam steam/question select I AGREE\nsteam steam/license note\n' \
+        | sudo debconf-set-selections 2>/dev/null || true
+    if sudo -E apt-get install -y steam-installer >>"$LOG" 2>&1; then
         ok "поставлен (докачает себя сам при первом запуске)"
     else
         warn "не удалось"; FAILED+=("Steam")
@@ -127,5 +137,7 @@ update-desktop-database "$APPS" >/dev/null 2>&1 || true
 say "Программы: готово"
 if [ ${#FAILED[@]} -gt 0 ]; then
     warn "не установились: ${FAILED[*]}"
+    echo "     Подробности: $LOG"
+    tail -12 "$LOG" 2>/dev/null | sed 's/^/       /'
     echo "     Запусти ./apps.sh ещё раз — уже поставленное пропустится."
 fi

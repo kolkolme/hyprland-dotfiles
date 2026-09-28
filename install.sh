@@ -23,17 +23,40 @@ read -rp $'\nПродолжить? [y/N] ' a; [[ "$a" =~ ^[Yy]$ ]] || exit 0
 
 # ---------------------------------------------------------------- пакеты
 say "Ставлю пакеты"
+
+# Пароль спрашиваем один раз, заранее и явно. Иначе sudo спросит его
+# посреди установки, и если вывод куда-то перенаправлен — запрос не видно,
+# и всё выглядит как зависший скрипт.
+echo "   Сейчас потребуется пароль sudo (один раз на всю установку)."
+sudo -v || { echo "Без sudo установить пакеты нельзя."; exit 1; }
+
+# Ни один пакет не должен открыть диалог и ждать ответа в тишине.
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+# sddm спрашивает, какой менеджер входа сделать основным — отвечаем заранее
+echo "sddm shared/default-x-display-manager select sddm" | sudo debconf-set-selections 2>/dev/null || true
+
 mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "$SRC/packages.txt")
-sudo apt-get update
-# по одному: один отсутствующий пакет не должен рушить всю установку
+LOG="$BACKUP/apt.log"; mkdir -p "$BACKUP"
+sudo apt-get update 2>&1 | tail -2
+
+# Сначала пробуем поставить всё одной командой — так быстрее и apt
+# сам разрулит зависимости. Если упадёт, разбираем по одному.
 MISSING=()
-for p in "${PKGS[@]}"; do
-    if sudo apt-get install -y --no-install-recommends "$p" >/dev/null 2>&1; then
-        ok "$p"
-    else
-        MISSING+=("$p"); warn "не встал: $p"
-    fi
-done
+echo "   Ставлю ${#PKGS[@]} пакетов одной командой, подробности в $LOG"
+if sudo -E apt-get install -y --no-install-recommends "${PKGS[@]}" >>"$LOG" 2>&1; then
+    ok "все ${#PKGS[@]} пакетов"
+else
+    warn "пакетом не вышло, ставлю по одному (так видно, что именно ломается)"
+    for p in "${PKGS[@]}"; do
+        if sudo -E apt-get install -y --no-install-recommends "$p" >>"$LOG" 2>&1; then
+            ok "$p"
+        else
+            MISSING+=("$p"); warn "не встал: $p"
+        fi
+    done
+fi
 
 # ---------------------------------------------------------------- конфиги
 say "Раскладываю конфиги в ~/.config"
@@ -118,6 +141,8 @@ fi
 say "Готово"
 if [ ${#MISSING[@]} -gt 0 ]; then
     warn "Не установились (поставь руками или пропусти): ${MISSING[*]}"
+    warn "Что сказал apt — последние строки:"
+    tail -15 "$LOG" 2>/dev/null | sed 's/^/       /'
 fi
 cat <<'EOT'
 
