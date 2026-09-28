@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# scroll — скорость прокрутки тачпада: меняет на лету и запоминает в конфиге.
+#
+#   scroll        показать текущее значение
+#   scroll 0.4    задать (1.0 — заводское, меньше — медленнее)
+#   scroll -      на шаг медленнее
+#   scroll +      на шаг быстрее
+
+set -u
+CONF="$HOME/.config/hypr/hyprland.conf"
+STEP=0.1
+
+cur() { hyprctl getoption input:touchpad:scroll_factor | awk '/float/{printf "%.2f", $2}'; }
+
+apply() {
+    local v=$1 tmp
+    hyprctl keyword input:touchpad:scroll_factor "$v" >/dev/null
+    # правим только строку внутри блока touchpad, чужие scroll_factor не трогаем
+    tmp=$(mktemp)
+    awk -v v="$v" '
+        /touchpad[[:space:]]*\{/            { inblk = 1 }
+        inblk && /^[[:space:]]*scroll_factor[[:space:]]*=/ { sub(/=[ \t]*[0-9.]+/, "= " v) }
+        inblk && /\}/                       { inblk = 0 }
+        { print }
+    ' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+    echo "скорость прокрутки: $v"
+}
+
+case "${1:-show}" in
+  show)   echo "сейчас: $(cur)   (1.00 — заводская, меньше — медленнее)" ;;
+  -|down) apply "$(python3 -c "print(max(0.10, round($(cur) - $STEP, 2)))")" ;;
+  +|up)   apply "$(python3 -c "print(min(3.00, round($(cur) + $STEP, 2)))")" ;;
+  *[!0-9.]*) echo "scroll [показать | 0.4 | + | -]"; exit 1 ;;
+  *)      apply "$1" ;;
+esac

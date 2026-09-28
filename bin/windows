@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""windows — переключатель окон в духе App Exposé: свайп четырьмя пальцами вверх.
+
+Показывает все окна со всех рабочих столов одним списком: иконка приложения,
+название окна и номер стола. Выбор — переход к окну (со сменой стола, если надо).
+
+  windows          список и переход
+  windows --names  то же, но без иконок (если тема иконок подводит)
+"""
+import json, os, subprocess, sys, glob
+
+ICON_DIRS = ["/usr/share/icons", os.path.expanduser("~/.local/share/icons"),
+             "/usr/share/pixmaps"]
+THEMES = ["Flat-Remix-Pink-Dark", "Papirus-Dark", "Adwaita", "hicolor"]
+
+
+def hypr(*args, parse=True):
+    out = subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+    return json.loads(out) if parse else out
+
+
+def desktop_entry(app_class):
+    """Icon= и Name= из .desktop-файла приложения."""
+    # Telegram и прочие снапоподобные добавляют к классу хвост вида ._40e0fe50
+    cl = app_class.split("._")[0].lower()
+    for d in ("/usr/share/applications", os.path.expanduser("~/.local/share/applications")):
+        for name in (f"{cl}.desktop", f"{app_class}.desktop"):
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                icon = title = None
+                for line in open(p, encoding="utf-8", errors="replace"):
+                    if line.startswith("Icon=") and not icon:
+                        icon = line.split("=", 1)[1].strip()
+                    elif line.startswith("Name=") and not title:
+                        title = line.split("=", 1)[1].strip()
+                return icon or cl, title
+    return cl, None
+
+
+def pretty(app_class):
+    """Человеческое имя приложения вместо org.telegram.desktop._40e0fe50."""
+    _, name = desktop_entry(app_class)
+    if name:
+        return name
+    base = app_class.split("._")[0]
+    part = [s for s in base.split(".") if s and not s.isdigit()]
+    return (part[-1] if part else base).capitalize()
+
+
+def desktop_icon(app_class):
+    return desktop_entry(app_class)[0]
+
+
+def icon_path(name):
+    """Первый подходящий файл иконки: сначала тема пользователя, потом hicolor."""
+    if os.path.isabs(name) and os.path.exists(name):
+        return name
+    for theme in THEMES:
+        for base in ICON_DIRS:
+            for ext in ("svg", "png"):
+                hits = glob.glob(f"{base}/{theme}/**/{name}.{ext}", recursive=True)
+                if hits:
+                    return sorted(hits, key=len)[0]
+    for base in ICON_DIRS:
+        for ext in ("svg", "png"):
+            hits = glob.glob(f"{base}/{name}.{ext}")
+            if hits:
+                return hits[0]
+    # ничего не нашли — общая иконка, чтобы список не «рвался»
+    for fallback in ("utilities-terminal", "application-x-executable"):
+        if fallback != name:
+            if (p := icon_path(fallback)):
+                return p
+    return None
+
+
+def main():
+    with_icons = "--names" not in sys.argv
+    clients = [c for c in hypr("clients", "-j") if c.get("mapped") and c.get("title")]
+    if not clients:
+        return
+    # текущее окно — первым в списке неудобно, поэтому наоборот: по столам
+    clients.sort(key=lambda c: (str(c["workspace"]["name"]), c["class"]))
+
+    lines, index = [], {}
+    for c in clients:
+        ws = c["workspace"]["name"]
+        title = c["title"][:60]
+        label = f"{pretty(c['class'])}  ·  {title}   [стол {ws}]"
+        index[label] = c["address"]
+        if with_icons and (p := icon_path(desktop_icon(c["class"]))):
+            lines.append(f"img:{p}:text:{label}")
+        else:
+            lines.append(label)
+
+    args = ["wofi", "--dmenu", "--prompt", "Окна", "--width", "720", "--height", "440",
+            "-i", "--cache-file", "/dev/null"]
+    if with_icons:
+        args += ["--allow-images", "-D", "image_size=22"]
+    style = os.path.expanduser("~/.config/wofi/style.css")
+    if os.path.exists(style):
+        args += ["--style", style]
+
+    r = subprocess.run(args, input="\n".join(lines), capture_output=True, text=True)
+    sel = r.stdout.strip()
+    if not sel:
+        return
+    if ":text:" in sel:
+        sel = sel.split(":text:", 1)[1]
+    addr = index.get(sel)
+    if addr:
+        subprocess.run(["hyprctl", "dispatch", "focuswindow", f"address:{addr}"],
+                       stdout=subprocess.DEVNULL)
+
+
+if __name__ == "__main__":
+    main()

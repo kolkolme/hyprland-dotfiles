@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Надёжный выход из Steam.
+# 1) штатный ключ -shutdown; 2) если не помог — пункт «Exit Steam» из меню в трее.
+pgrep -x steam >/dev/null || { notify-send -a Steam "Steam не запущен"; exit 0; }
+notify-send -a Steam -t 2500 "Steam" "Закрываю…"
+
+steam -shutdown >/dev/null 2>&1
+
+for _ in $(seq 1 10); do
+    sleep 1
+    pgrep -x steam >/dev/null || { notify-send -a Steam "Steam закрыт"; exit 0; }
+done
+
+# запасной путь: дёрнуть пункт меню из значка в трее
+svc=$(busctl --user call org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+        org.freedesktop.DBus.Properties Get ss org.kde.StatusNotifierWatcher \
+        RegisteredStatusNotifierItems 2>/dev/null | tr ' ' '\n' | tr -d '"' | grep -i steam)
+if [[ -n $svc ]]; then
+    bus=${svc%%/*}; path=/${svc#*/}
+    menu=$(busctl --user get-property "$bus" "$path" org.kde.StatusNotifierItem Menu 2>/dev/null | awk '{print $2}' | tr -d '"')
+    if [[ -n $menu ]]; then
+        id=$(busctl --user call "$bus" "$menu" com.canonical.dbusmenu GetLayout iias 0 2 1 label 2>/dev/null |
+             grep -oP '\(ia\{sv\}av\) \K[0-9]+(?= 1 "label" s "Exit Steam")')
+        [[ -n $id ]] && busctl --user call "$bus" "$menu" com.canonical.dbusmenu Event isvu "$id" clicked s "" 0 >/dev/null 2>&1
+    fi
+fi
+
+for _ in $(seq 1 10); do
+    sleep 1
+    pgrep -x steam >/dev/null || { notify-send -a Steam "Steam закрыт"; exit 0; }
+done
+notify-send -a Steam -u critical "Steam не закрылся" "Попробуй ещё раз или закрой окно вручную"

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Показывает шпаргалку по горячим клавишам Hyprland
+grep -E '^\s*(bind|binde|bindm|bindl|bindel)\s*=' "$HOME/.config/hypr/hyprland.conf" \
+  | sed -E 's/^\s*bind[elm]*\s*=\s*//; s/\$mod/SUPER/g' \
+  | awk -F',' '{
+      mods=$1; key=$2; act=$3;
+      gsub(/^ +| +$/,"",mods); gsub(/^ +| +$/,"",key); gsub(/^ +| +$/,"",act);
+      rest="";
+      for(i=4;i<=NF;i++) rest=rest (i>4?",":"") $i;
+      gsub(/^ +/,"",rest);
+      combo = (mods=="" ? key : mods" + "key);
+      printf "%-28s  %s %s\n", combo, act, rest;
+    }' \
+  | wofi --dmenu --prompt "Горячие клавиши" --width 780 --height 600 >/dev/null

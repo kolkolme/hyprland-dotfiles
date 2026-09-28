@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Пишет пульс раз в 5 сек: отвечает ли Hyprland по IPC.
+# Последняя строка с OK = момент, когда компоновщик ещё был жив.
+OUT="$HOME/hypr-heartbeat.log"
+i=0
+while true; do
+  if timeout 3 hyprctl -j monitors >/dev/null 2>&1; then st=OK; else st="НЕ ОТВЕЧАЕТ"; fi
+  printf '%s  +%3ds  %s  окон:%s\n' "$(date +%H:%M:%S)" "$i" "$st" \
+    "$(timeout 3 hyprctl -j clients 2>/dev/null | grep -c '"class"' || echo '?')" >> "$OUT"
+  i=$((i+5)); sleep 5
+done

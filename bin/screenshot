@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Скриншот с уведомлением-превью.
+#   screenshot area   — область → файл + буфер
+#   screenshot full   — весь экран → файл + буфер
+#   screenshot clip   — область → только буфер
+mode=${1:-area}
+dir="$HOME/Pictures"
+file="$dir/scr-$(date +%F_%H-%M-%S).png"
+tmp=$(mktemp --suffix=.png)
+trap 'rm -f "$tmp"' EXIT
+
+if [[ $mode == full ]]; then
+    grim "$tmp" || exit 1
+else
+    geom=$(slurp) || exit 0          # Esc при выделении — просто выходим
+    grim -g "$geom" "$tmp" || exit 1
+fi
+
+wl-copy < "$tmp"
+if [[ $mode == clip ]]; then
+    cp "$tmp" "${tmp%.png}-n.png"; icon="${tmp%.png}-n.png"
+    notify-send -a Скриншот -i "$icon" "Скриншот в буфере" "Можно вставлять через Ctrl+V"
+    (sleep 10; rm -f "$icon") &
+else
+    mkdir -p "$dir"; cp "$tmp" "$file"
+    notify-send -a Скриншот -i "$file" "Скриншот сохранён" "${file/#$HOME/\~}\nи скопирован в буфер"
+fi

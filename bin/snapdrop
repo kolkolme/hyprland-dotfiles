@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""snapdrop — что делать с окном, когда его бросили мышью.
+
+Вызывается Hyprland при отпускании Super+ЛКМ (bindr). Правила:
+
+  бросил у края экрана   → окно прилипает к этому краю половиной
+  бросил в угол          → четвертью
+  бросил посередине      → возвращается в плиточную сетку
+
+Плиточные окна не трогаем: их перетаскивание Hyprland и так завершает обменом
+местами. Работаем только с плавающими.
+"""
+import json, os, subprocess, sys
+
+EDGE = 90            # px: насколько близко край ОКНА к границе экрана
+CURSOR_EDGE = 25     # px: либо сам указатель ткнулся в границу
+MIDDLE_BAND = (0.30, 0.70)   # какая доля края считается «по центру»
+STATE = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/snapdrop-last"
+
+
+def hypr(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def js(*args):
+    try:
+        return json.loads(hypr(*args, "-j"))
+    except ValueError:
+        return None
+
+
+def main():
+    want = None
+    if "--window" in sys.argv:
+        want = sys.argv[sys.argv.index("--window") + 1]
+    if want:
+        win = next((c for c in (js("clients") or []) if c["address"] == want), None)
+    else:
+        win = js("activewindow")
+    if not win or not win.get("address"):
+        return
+    if not win.get("floating"):
+        return                      # плиточное: Hyprland уже поменял его местами
+
+    addr = win["address"]
+    wx, wy = win["at"]
+
+    # Простой клик без перетаскивания не должен ничего менять: если окно с
+    # прошлого раза не сдвинулось — значит это клик, а не бросок.
+    try:
+        prev = open(STATE).read().split()
+        if prev[:3] == [addr, str(wx), str(wy)]:
+            return
+    except (OSError, IndexError):
+        pass
+    try:
+        open(STATE, "w").write(f"{addr} {wx} {wy}")
+    except OSError:
+        pass
+
+    mons = js("monitors") or []
+    mon = next((m for m in mons if m.get("focused")), None)
+    if not mon:
+        return
+    # рабочая область: за вычетом панели и прочих зарезервированных полос
+    res = mon.get("reserved", [0, 0, 0, 0])   # left, top, right, bottom
+    ax = mon["x"] + res[0]
+    ay = mon["y"] + res[1]
+    aw = mon["width"] - res[0] - res[2]
+    ah = mon["height"] - res[1] - res[3]
+
+    pos = hypr("cursorpos").strip().replace(" ", "")
+    try:
+        cx, cy = (int(v) for v in pos.split(","))
+    except ValueError:
+        cx = cy = None
+
+    # ⚠️⚠️ Край определяем по ОКНУ, а не только по указателю.
+    # Первая версия смотрела лишь на курсор — и промахивалась постоянно: окно
+    # берут за середину, поэтому когда его край уже у границы экрана, указатель
+    # всё ещё в паре сотен пикселей от неё.
+    ww, wh = win.get("size", [0, 0])
+    dl, dr = wx - ax, (ax + aw) - (wx + ww)      # отрицательные — окно вылезло за край
+    dt, db = wy - ay, (ay + ah) - (wy + wh)
+
+    near = lambda d: d < EDGE
+    left = near(dl) or (cx is not None and cx - ax < CURSOR_EDGE)
+    right = near(dr) or (cx is not None and (ax + aw) - cx < CURSOR_EDGE)
+    top = near(dt) or (cy is not None and cy - ay < CURSOR_EDGE)
+    bottom = near(db) or (cy is not None and (ay + ah) - cy < CURSOR_EDGE)
+    if left and right:      # окно шириной почти во весь экран — это не «прилепить»
+        left = right = False
+    if top and bottom:
+        top = bottom = False
+
+    # ⚠️ Вдоль края важно, НАСКОЛЬКО по центру принесли окно.
+    # Ровно посередине правого края — «хочу всю правую половину, плевать на
+    # горизонтальное деление». Ближе к верху или низу — намерение другое:
+    # просто встроить окно в сетку на эту сторону, не ломая раскладку.
+    def middle(value, start_, length):
+        k = (value - start_) / length if length else 0.5
+        return MIDDLE_BAND[0] <= k <= MIDDLE_BAND[1]
+
+    cxw, cyw = wx + ww // 2, wy + wh // 2        # середина окна
+    gap = 8
+    half_w = (aw - gap * 3) // 2
+    half_h = (ah - gap * 3) // 2
+
+    box = None
+    if left and middle(cyw, ay, ah):
+        box = (ax + gap, ay + gap, half_w, ah - gap * 2)
+    elif right and middle(cyw, ay, ah):
+        box = (ax + gap * 2 + half_w, ay + gap, half_w, ah - gap * 2)
+    elif top and middle(cxw, ax, aw):
+        box = (ax + gap, ay + gap, aw - gap * 2, half_h)
+    elif bottom and middle(cxw, ax, aw):
+        box = (ax + gap, ay + gap * 2 + half_h, aw - gap * 2, half_h)
+
+    if os.environ.get("SNAPDROP_DEBUG"):
+        print(f"окно ({wx},{wy}) {ww}x{wh} · центр ({cxw},{cyw}) · курсор ({cx},{cy})\n"
+              f"  до краёв: слева {dl} справа {dr} сверху {dt} снизу {db}\n"
+              f"  края: left={left} right={right} top={top} bottom={bottom}\n"
+              f"  решение: {'прилепить ' + str(box) if box else 'встроить в сетку'}",
+              file=sys.stderr)
+
+    if box is None:
+        # либо принесли не к краю, либо к краю, но не по центру — в сетку,
+        # Hyprland сам поставит окно туда, где сейчас указатель
+        hypr("dispatch", "settiled", f"address:{addr}")
+        return
+
+    x, y, w, h = box
+    hypr("--batch",
+         f"dispatch resizewindowpixel exact {w} {h},address:{addr};"
+         f"dispatch movewindowpixel exact {x} {y},address:{addr}")
+
+
+if __name__ == "__main__":
+    main()

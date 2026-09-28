@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# glass — «жидкое стекло»: прозрачность терминалов и характер размытия.
+#
+#   glass              показать, что стоит сейчас
+#   glass soft         лёгкая матовость
+#   glass liquid       основной стеклянный вид
+#   glass deep         максимум прозрачности (тяжелее для видеокарты)
+#   glass off          вернуть как было до первого включения
+#   glass 0.65         своя прозрачность фона терминала, остальное не трогая
+#
+# Меняет и вживую, и в конфигах, так что переживает перезапуск.
+# Прозрачность фона делает kitty, а не Hyprland: у kitty полупрозрачен только
+# фон, а буквы остаются плотными. Прозрачность окна в Hyprland размывала бы и
+# текст — читать такое невозможно.
+
+set -u
+KITTY="$HOME/.config/kitty/kitty.conf"
+HYPR="$HOME/.config/hypr/hyprland.conf"
+SAVE="$HOME/.config/hypr/.glass-before"
+
+# пресет: opacity size passes vibrancy vib_dark noise contrast brightness
+preset() {
+    case "$1" in
+        soft)   echo "0.80 6  2 0.25 0.05 0.015 0.95 0.97" ;;
+        liquid) echo "0.68 8  3 0.45 0.20 0.020 1.00 0.90" ;;
+        deep)   echo "0.55 10 4 0.60 0.30 0.025 1.05 0.85" ;;
+        *) return 1 ;;
+    esac
+}
+
+hget() { hyprctl getoption "$1" | awk '/int:|float:/{print $2; exit}'; }
+
+current() {
+    echo "прозрачность терминала: $(grep -oP '^background_opacity\s+\K[0-9.]+' "$KITTY" 2>/dev/null)"
+    printf "размытие: size %s · passes %s · vibrancy %s · тени %s\n" \
+        "$(hget decoration:blur:size)" "$(hget decoration:blur:passes)" \
+        "$(hget decoration:blur:vibrancy)" "$(hget decoration:blur:vibrancy_darkness)"
+    printf "шум %s · контраст %s · яркость %s\n" \
+        "$(hget decoration:blur:noise)" "$(hget decoration:blur:contrast)" \
+        "$(hget decoration:blur:brightness)"
+}
+
+save_once() {
+    [ -f "$SAVE" ] && return
+    { echo "opacity=$(grep -oP '^background_opacity\s+\K[0-9.]+' "$KITTY")"
+      echo "size=$(hget decoration:blur:size)"
+      echo "passes=$(hget decoration:blur:passes)"
+      echo "vibrancy=$(hget decoration:blur:vibrancy)"
+      echo "vdark=$(hget decoration:blur:vibrancy_darkness)"
+      echo "noise=$(hget decoration:blur:noise)"
+      echo "contrast=$(hget decoration:blur:contrast)"
+      echo "bright=$(hget decoration:blur:brightness)"; } > "$SAVE"
+}
+
+set_kitty() {
+    sed -i "s/^background_opacity\s\+[0-9.]\+/background_opacity $1/" "$KITTY"
+    pkill -SIGUSR1 -x kitty          # kitty перечитывает конфиг на лету
+}
+
+set_blur() {    # size passes vibrancy vib_dark noise contrast brightness
+    local k v
+    for k in size:$1 passes:$2 vibrancy:$3 vibrancy_darkness:$4 noise:$5 contrast:$6 brightness:$7; do
+        hyprctl keyword "decoration:blur:${k%%:*}" "${k#*:}" >/dev/null
+    done
+    # и в конфиг, чтобы пережило перезапуск: правим только строки внутри blur {}
+    python3 - "$HYPR" "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PY'
+import re, sys
+path, size, passes, vib, vdark, noise, contrast, bright = sys.argv[1:9]
+vals = {"size": size, "passes": passes, "vibrancy": vib, "vibrancy_darkness": vdark,
+        "noise": noise, "contrast": contrast, "brightness": bright}
+t = open(path).read()
+m = re.search(r"(?s)blur \{.*?\n    \}", t)
+if not m:
+    sys.exit(0)
+block = m.group(0)
+for key, val in vals.items():
+    if re.search(rf"(?m)^\s*{key}\s*=", block):
+        block = re.sub(rf"(?m)^(\s*{key}\s*=\s*)[0-9.]+", lambda x: x.group(1) + val, block)
+    else:                                   # такой строки ещё не было — добавляем
+        block = block.rstrip()[:-1].rstrip() + f"\n        {key} = {val}\n    }}"
+open(path, "w").write(t[:m.start()] + block + t[m.end():])
+PY
+}
+
+case "${1:-show}" in
+  show) current ;;
+  off)
+    [ -f "$SAVE" ] || { echo "нечего возвращать: стеклянный режим не включался"; exit 0; }
+    . "$SAVE"
+    set_kitty "$opacity"
+    set_blur "$size" "$passes" "$vibrancy" "$vdark" "$noise" "$contrast" "$bright"
+    rm -f "$SAVE"
+    echo "вернул как было"; current ;;
+  soft|liquid|deep)
+    save_once
+    read -r o s p v vd n c b <<<"$(preset "$1")"
+    set_kitty "$o"; set_blur "$s" "$p" "$v" "$vd" "$n" "$c" "$b"
+    echo "режим: $1"; current ;;
+  *)
+    case "$1" in 0.[0-9]|0.[0-9][0-9]|1|1.0) ;; *) echo "glass [soft|liquid|deep|off|0.65]"; exit 1 ;; esac
+    save_once; set_kitty "$1"; echo "прозрачность терминала: $1" ;;
+esac

@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""tasks — задачник в терминале.
+
+  tasks                 открыть список (TUI)
+  tasks add ТЕКСТ       добавить задачу, не открывая окно
+  tasks quickadd        спросить текст через wofi (Super+Shift+T)
+  tasks list            вывести списком в stdout
+  tasks sub N ТЕКСТ     добавить подзадачу к задаче N
+  tasks done N          отметить задачу N выполненной
+  tasks rm N            убрать задачу N в корзину (вместе с подзадачами)
+  tasks restore         вернуть последнее убранное
+  tasks --trash         показать корзину
+  tasks --widget        режим виджета: только показывает, сам обновляется
+  tasks --status        JSON для модуля Waybar
+  tasks --help          справка
+
+Переменная TASKS_FILE задаёт другой файл со списком.
+
+Цвета берутся из палитры терминала (kitty), поэтому wallpick перекрашивает
+задачник вместе со всей системой. Данные — ~/.local/share/tasks.json
+"""
+import curses, json, locale, os, re, subprocess, sys, time
+from datetime import date, datetime, timedelta
+
+locale.setlocale(locale.LC_ALL, "")
+
+# файл задач; TASKS_FILE позволяет держать отдельный список (тесты, работа/дом)
+DATA = os.path.expanduser(os.environ.get("TASKS_FILE", "~/.local/share/tasks.json"))
+PRI_MARK = {0: "  ", 1: "! ", 2: "!!"}
+WEEK = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+          "августа", "сентября", "октября", "ноября", "декабря"]
+
+# ─────────────────────────────── данные ──────────────────────────────────
+
+def load():
+    try:
+        with open(DATA, encoding="utf-8") as f:
+            d = json.load(f)
+        d.setdefault("tasks", [])
+        d.setdefault("trash", [])
+        d.setdefault("next_id", max((t["id"] for t in d["tasks"]), default=0) + 1)
+        for t in d["tasks"]:
+            t.setdefault("parent", None)        # файлы, созданные до подзадач
+        return d
+    except (OSError, ValueError):
+        return {"tasks": [], "next_id": 1, "trash": []}
+
+
+def save(d):
+    os.makedirs(os.path.dirname(DATA), exist_ok=True)
+    tmp = DATA + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, DATA)      # атомарно: виджет никогда не прочтёт половину файла
+
+
+def add_task(d, text, pri=0, due=None, parent=None):
+    t = {"id": d["next_id"], "text": text.strip(), "done": False,
+         "pri": pri, "due": due, "parent": parent,
+         "created": date.today().isoformat()}
+    d["tasks"].append(t)
+    d["next_id"] += 1
+    return t
+
+
+def kids(d, tid):
+    """Подзадачи задачи tid в том же порядке, что и верхний уровень."""
+    return order([t for t in d["tasks"] if t.get("parent") == tid])
+
+
+def progress(d, tid):
+    """(сделано, всего) по подзадачам. (0, 0) — подзадач нет."""
+    ch = [t for t in d["tasks"] if t.get("parent") == tid]
+    return sum(1 for c in ch if c["done"]), len(ch)
+
+
+def set_done(d, task, value):
+    """Отметить задачу. Родитель тянет за собой детей, дети — родителя."""
+    task["done"] = value
+    if task.get("parent") is None:
+        for c in d["tasks"]:
+            if c.get("parent") == task["id"]:
+                c["done"] = value
+    else:
+        parent = next((p for p in d["tasks"] if p["id"] == task["parent"]), None)
+        if parent:
+            done, total = progress(d, parent["id"])
+            parent["done"] = total > 0 and done == total
+
+
+def to_trash(d, task):
+    """Убрать задачу вместе с подзадачами в корзину (не удаляя насовсем)."""
+    group = [task] + [c for c in d["tasks"] if c.get("parent") == task["id"]]
+    d.setdefault("trash", []).append(group)
+    d["trash"] = d["trash"][-50:]
+    for g in group:
+        if g in d["tasks"]:
+            d["tasks"].remove(g)
+    return len(group)
+
+
+def from_trash(d):
+    """Вернуть последнее убранное."""
+    if not d.get("trash"):
+        return 0
+    group = d["trash"].pop()
+    d["tasks"].extend(group)
+    return len(group)
+
+
+def parse_due(s):
+    """«сегодня», «завтра», «+3d», «пт», «26.09», «2026-09-26» → ISO-дата."""
+    s = (s or "").strip().lower()
+    if not s or s in ("-", "нет", "убрать"):
+        return None
+    today = date.today()
+    if s in ("сегодня", "today"):
+        return today.isoformat()
+    if s in ("завтра", "tomorrow"):
+        return (today + timedelta(days=1)).isoformat()
+    if s in ("послезавтра",):
+        return (today + timedelta(days=2)).isoformat()
+    if m := re.fullmatch(r"\+?(\d+)\s*(d|д|дн\w*)?", s):
+        return (today + timedelta(days=int(m.group(1)))).isoformat()
+    if s[:2] in WEEK:                       # ближайший такой день недели
+        target = WEEK.index(s[:2])
+        delta = (target - today.weekday()) % 7 or 7
+        return (today + timedelta(days=delta)).isoformat()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m", "%d/%m"):
+        try:
+            dt = datetime.strptime(s, fmt).date()
+            if fmt in ("%d.%m", "%d/%m"):
+                dt = dt.replace(year=today.year)
+                if dt < today:
+                    dt = dt.replace(year=today.year + 1)
+            return dt.isoformat()
+        except ValueError:
+            pass
+    return None
+
+
+def due_label(iso):
+    """Человеческая подпись срока и насколько он горит: 0 спокойно, 1 сегодня, 2 просрочено."""
+    if not iso:
+        return "", 0
+    try:
+        d = date.fromisoformat(iso)
+    except ValueError:
+        return "", 0
+    delta = (d - date.today()).days
+    if delta < 0:
+        n = -delta
+        word = "день" if n % 10 == 1 and n % 100 != 11 else \
+               "дня" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "дней"
+        return f"{n} {word} назад", 2
+    if delta == 0:
+        return "сегодня", 1
+    if delta == 1:
+        return "завтра", 1
+    if delta < 7:
+        return WEEK[d.weekday()], 0
+    return f"{d.day} {MONTHS[d.month - 1][:3]}", 0
+
+
+def order(tasks):
+    """Невыполненные сверху: сначала важность, потом срок."""
+    def k(t):
+        due = t.get("due") or "9999-99-99"
+        return (t["done"], -t.get("pri", 0), due, t["id"])
+    return sorted(tasks, key=k)
+
+
+def flatten(d, show_done=True, flt=""):
+    """Плоский список для отрисовки: родитель, под ним его подзадачи.
+
+    Возвращает пары (задача, это_подзадача). Поиск ищет и по подзадачам:
+    если нашлась только подзадача, родитель всё равно показывается — иначе
+    непонятно, к чему она относится."""
+    def match(t):
+        return not flt or flt.lower() in t["text"].lower()
+
+    out = []
+    for p in order([t for t in d["tasks"] if t.get("parent") is None]):
+        ch = kids(d, p["id"])
+        hit = match(p) or any(match(c) for c in ch)
+        if not hit:
+            continue
+        if not show_done and p["done"] and all(c["done"] for c in ch):
+            continue
+        out.append((p, False))
+        for c in ch:
+            if not show_done and c["done"]:
+                continue
+            out.append((c, True))
+    # осиротевшие подзадачи (родителя удалили руками в файле) — показываем как обычные
+    known = {t["id"] for t in d["tasks"]}
+    for t in order([t for t in d["tasks"]
+                    if t.get("parent") is not None and t["parent"] not in known]):
+        if match(t) and (show_done or not t["done"]):
+            out.append((t, False))
+    return out
+
+
+# ──────────────────────────── отрисовка строки ───────────────────────────
+
+def row_text(t, width):
+    mark = "✓" if t["done"] else "○"
+    pri = PRI_MARK.get(t.get("pri", 0), "  ")
+    due, _ = due_label(t.get("due"))
+    space = width - 4 - len(pri) - (len(due) + 2 if due else 0)
+    text = t["text"]
+    if len(text) > space:
+        text = text[: max(1, space - 1)] + "…"
+    pad = " " * max(0, space - len(text))
+    return mark, pri, text, pad, due
+
+
+# ─────────────────────────────── TUI ─────────────────────────────────────
+
+C_FRAME, C_TEXT, C_MUTED, C_PRI, C_HOT, C_DONE, C_SEL, C_HINT = range(1, 9)
+
+# Клавиши читаются по расположению на клавиатуре, а не по букве: в русской
+# раскладке «ф» лежит там же, где «a», поэтому задачник слушается одинаково
+# в обеих раскладках и переключать её не нужно.
+RU2EN = str.maketrans(
+    "йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,",
+    "qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?")
+
+
+def key(ch):
+    """Нажатие → латинский эквивалент.
+
+    Переводим только кириллицу: латиница и знаки препинания должны доходить
+    как есть, иначе «.» превратилась бы в «/» — она стоит на той же клавише."""
+    if isinstance(ch, str) and ch and ("а" <= ch.lower() <= "я" or ch.lower() == "ё"):
+        return ch.translate(RU2EN)
+    return ch
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()            # прозрачный фон — виден блюр kitty
+    curses.init_pair(C_FRAME, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_TEXT,  -1, -1)
+    curses.init_pair(C_MUTED, 8, -1)
+    curses.init_pair(C_PRI,   curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_HOT,   curses.COLOR_RED, -1)
+    curses.init_pair(C_DONE,  curses.COLOR_GREEN, -1)
+    curses.init_pair(C_SEL,   curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_HINT,  8, -1)
+
+
+def prompt(win, y, w, label, initial=""):
+    """Однострочный ввод внизу окна. Enter — принять, Esc — отменить."""
+    buf = list(initial)
+    curses.curs_set(1)
+    while True:
+        line = label + "".join(buf)
+        win.move(y, 1)
+        win.clrtoeol()
+        win.addstr(y, 2, line[: w - 4], curses.color_pair(C_TEXT))
+        try:                                   # вернуть правую грань рамки
+            win.addstr(y, w - 1, "│", curses.color_pair(C_FRAME))
+        except curses.error:
+            pass
+        try:
+            win.addstr(y, min(2 + len(line), w - 3), "")
+        except curses.error:
+            pass
+        win.refresh()
+        try:
+            ch = win.get_wch()
+        except curses.error:
+            continue
+        if ch in ("\n", "\r", curses.KEY_ENTER, 10, 13):
+            curses.curs_set(0)
+            return "".join(buf).strip()
+        if ch == "\x1b":
+            curses.curs_set(0)
+            return None
+        if ch in ("\x7f", "\b", curses.KEY_BACKSPACE, 263):
+            if buf:
+                buf.pop()
+        elif isinstance(ch, str) and ch.isprintable():
+            buf.append(ch)
+
+
+HELP = [
+    ("↓ ↑  j k", "двигаться по списку"),
+    ("Home End", "в начало / в конец списка"),
+    ("a   Ins", "добавить задачу"),
+    ("s", "добавить подзадачу к выбранной"),
+    ("x  Enter", "отметить выполненной"),
+    ("e", "изменить текст"),
+    ("p", "важность: нет → ! → !!"),
+    ("t", "срок: сегодня, завтра, пт, +3, 26.09"),
+    ("d   Del", "убрать в корзину · u вернуть"),
+    ("c", "убрать все выполненные разом"),
+    ("h", "показать/скрыть выполненные"),
+    ("/", "поиск по тексту"),
+    ("?", "эта справка   ·   q выход"),
+    ("", ""),
+    ("раскладка", "любая: ф=a, ч=x, у=e, в=d, о/л=j/k"),
+]
+
+
+def draw_help(win, h, w):
+    """Шпаргалка поверх списка. В маленьком окне показывает, сколько влезло."""
+    bw = min(54, max(24, w - 2))
+    rows = min(len(HELP), max(1, h - 5))          # не рисуем за нижнюю грань
+    bh = min(rows + 4, h)
+    y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+    box = win.derwin(bh, bw, y0, x0)
+    box.erase()
+    box.attrset(curses.color_pair(C_FRAME))
+    box.box()
+    box.addstr(0, 2, " КЛАВИШИ ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+    for i, (k, v) in enumerate(HELP[:rows], start=2):
+        if i >= bh - 1:
+            break
+        try:
+            box.addstr(i, 3, f"{k:<11}"[: bw - 5], curses.color_pair(C_PRI))
+            box.addstr(i, 15, v[: bw - 17], curses.color_pair(C_MUTED))
+        except curses.error:
+            pass
+    if rows < len(HELP):
+        try:
+            box.addstr(bh - 1, 2, " окно мало — растяни ",
+                       curses.color_pair(C_MUTED))
+        except curses.error:
+            pass
+    box.refresh()
+    win.get_wch()
+
+
+def tui(stdscr):
+    curses.curs_set(0)
+    try: curses.set_escdelay(25)      # иначе Esc срабатывает через секунду
+    except Exception: pass
+    init_colors()
+    stdscr.keypad(True)
+    d = load()
+    sel, show_done, flt, msg = 0, True, "", ""
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        rows = flatten(d, show_done, flt)
+        sel = max(0, min(sel, len(rows) - 1))
+
+        total = len(d["tasks"])
+        left = sum(1 for t in d["tasks"] if not t["done"])
+        stdscr.erase()
+        stdscr.attrset(curses.color_pair(C_FRAME))
+        stdscr.box()
+        stdscr.addstr(0, 2, " ЗАДАЧИ ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+        counter = f" {left} из {total} "
+        if flt:
+            counter = f" поиск: {flt} " + counter
+        stdscr.addstr(0, max(3, w - len(counter) - 3), counter, curses.color_pair(C_MUTED))
+
+        body_h = h - 4
+        top = max(0, sel - body_h + 2) if sel >= body_h else 0
+        view = rows[top: top + body_h]
+
+        if not view:
+            empty = "пока пусто \u2014 нажми «a», чтобы добавить" if not flt else "ничего не нашлось"
+            try:
+                stdscr.addstr(h // 2, max(2, (w - len(empty)) // 2), empty[: w - 4],
+                              curses.color_pair(C_MUTED))
+            except curses.error:
+                pass
+
+        for i, (t, is_sub) in enumerate(view):
+            y = 2 + i
+            is_sel = (top + i) == sel
+            due, hot = due_label(t.get("due"))
+            pri = PRI_MARK.get(t.get("pri", 0), "  ")
+            # у родителя с подзадачами вместо срока показываем «сделано/всего»
+            badge = ""
+            if not is_sub:
+                dn, tot = progress(d, t["id"])
+                if tot:
+                    badge = f"{dn}/{tot}"
+            right = f"{badge}  {due}".strip() if badge and due else (badge or due)
+
+            x = 2
+            try:
+                stdscr.addstr(y, x, "▸ " if is_sel else "  ",
+                              curses.color_pair(C_SEL) | curses.A_BOLD)
+                x += 2
+                if is_sub:                       # веточка к родителю
+                    stdscr.addstr(y, x, "  └ ", curses.color_pair(C_MUTED))
+                    x += 4
+                stdscr.addstr(y, x, ("✓" if t["done"] else "○") + " ",
+                              curses.color_pair(C_DONE if t["done"] else C_MUTED))
+                x += 2
+                stdscr.addstr(y, x, pri,
+                              curses.color_pair(C_HOT if t.get("pri") == 2 else C_PRI)
+                              | (curses.A_BOLD if t.get("pri") else 0))
+                x += len(pri) + 1
+
+                avail = w - x - (len(right) + 3 if right else 2)
+                text = t["text"]
+                if len(text) > avail > 1:
+                    text = text[: avail - 1] + "…"
+                attr = curses.color_pair(C_MUTED) if t["done"] else curses.color_pair(C_TEXT)
+                if t["done"]:
+                    attr |= curses.A_DIM
+                if is_sel and not t["done"]:
+                    attr |= curses.A_BOLD
+                stdscr.addstr(y, x, text, attr)
+
+                if right:
+                    rattr = curses.color_pair(
+                        C_MUTED if t["done"] or (hot == 0 and not badge)
+                        else C_PRI if hot == 1 or badge else C_HOT)
+                    stdscr.addstr(y, max(x + 1, w - len(right) - 3), right, rattr)
+            except curses.error:
+                pass
+
+        hint = msg or "a добавить · s подзадача · x готово · d убрать · ? клавиши"
+        try:
+            stdscr.addstr(h - 2, 2, hint[: w - 4],
+                          curses.color_pair(C_PRI if msg else C_HINT))
+        except curses.error:
+            pass
+        stdscr.refresh()
+        msg = ""
+
+        try:
+            ch = key(stdscr.get_wch())
+        except curses.error:
+            continue
+        cur = rows[sel][0] if rows else None
+        cur_is_sub = rows[sel][1] if rows else False
+
+        if ch in ("q", "Q", "\x1b"):
+            break
+        elif ch in ("j", curses.KEY_DOWN):
+            sel = min(sel + 1, len(rows) - 1)
+        elif ch in ("k", curses.KEY_UP):
+            sel = max(sel - 1, 0)
+        elif ch in ("g", curses.KEY_HOME):
+            sel = 0
+        elif ch in ("G", curses.KEY_END):
+            sel = len(rows) - 1
+        elif ch == curses.KEY_NPAGE:
+            sel = min(sel + max(1, h - 6), len(rows) - 1)
+        elif ch == curses.KEY_PPAGE:
+            sel = max(sel - max(1, h - 6), 0)
+        elif ch in ("a", curses.KEY_IC):
+            text = prompt(stdscr, h - 2, w, "новая задача: ")
+            if text:
+                add_task(d, text)
+                save(d)
+                msg = "добавлено"
+        elif ch == "s" and cur:
+            # подзадача к выбранной; если выбрана подзадача — к её родителю
+            pid = cur["parent"] if cur_is_sub else cur["id"]
+            owner = next((x for x in d["tasks"] if x["id"] == pid), cur)
+            label = f"подзадача к «{owner['text'][:28]}»: "
+            text = prompt(stdscr, h - 2, w, label)
+            if text:
+                add_task(d, text, parent=pid)
+                if owner["done"]:
+                    owner["done"] = False      # появилось незакрытое дело
+                save(d)
+                msg = "подзадача добавлена"
+        elif ch in ("x", " ", "\n", "\r", curses.KEY_ENTER) and cur:
+            set_done(d, cur, not cur["done"])
+            save(d)
+        elif ch == "e" and cur:
+            text = prompt(stdscr, h - 2, w, "текст: ", cur["text"])
+            if text:
+                cur["text"] = text
+                save(d)
+        elif ch == "p" and cur:
+            cur["pri"] = (cur.get("pri", 0) + 1) % 3
+            save(d)
+        elif ch == "t" and cur:
+            s = prompt(stdscr, h - 2, w, "срок (сегодня/завтра/пт/+3/26.09, «-» убрать): ")
+            if s is not None:
+                cur["due"] = parse_due(s)
+                save(d)
+                msg = "срок не распознан" if s and not cur["due"] else ""
+        elif ch in ("d", curses.KEY_DC) and cur:
+            _, tot = progress(d, cur["id"])
+            if tot and not cur_is_sub:
+                ok = prompt(stdscr, h - 2, w,
+                            f"убрать вместе с подзадачами ({tot})? д/н: ")
+                # ответ сравниваем как есть: через таблицу раскладок «д» стало бы «l»
+                if (ok or "").strip().lower() not in ("y", "yes", "д", "да", "l"):
+                    msg = "отменено"
+                    continue
+            n = to_trash(d, cur)
+            save(d)
+            msg = f"убрано ({n}) · «u» вернуть"
+        elif ch == "u":
+            n = from_trash(d)
+            save(d)
+            msg = f"возвращено ({n})" if n else "корзина пуста"
+        elif ch == "c":
+            gone = [t for t in d["tasks"]
+                    if t["done"] and t.get("parent") is None]
+            if gone:
+                cnt = sum(to_trash(d, g) for g in gone)
+                save(d)
+                msg = f"убрано выполненных: {cnt} · «u» вернуть по одной"
+            else:
+                msg = "выполненных нет"
+        elif ch == "h":
+            show_done = not show_done
+        elif ch in ("/", "."):          # в русской раскладке эта клавиша даёт точку
+            flt = prompt(stdscr, h - 2, w, "поиск: ", flt) or ""
+        elif ch in ("?", ","):          # Shift над той же клавишей — запятая
+            draw_help(stdscr, h, w)
+
+
+# ────────────────────────────── виджет ───────────────────────────────────
+
+A = {"frame": "\033[35m", "muted": "\033[90m", "hot": "\033[31m",
+     "warn": "\033[33m", "done": "\033[32m", "off": "\033[0m", "b": "\033[1m"}
+
+
+def widget(interval=2.0):
+    """Только показывает. Перерисовывает, когда файл изменился или сменился день."""
+    print("\033[?25l", end="")                       # спрятать курсор
+    last, day = None, None
+    try:
+        while True:
+            try:
+                stamp = os.stat(DATA).st_mtime
+            except OSError:
+                stamp = 0
+            today = date.today()
+            if (stamp, today) != (last, day):
+                last, day = stamp, today
+                render_widget()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\033[?25h", end="")
+
+
+def render_widget():
+    d = load()
+    rows = [(t, sub) for t, sub in flatten(d, show_done=False)][:12]
+    items = [t for t, _ in rows if not t.get("parent")]
+    done_n = sum(1 for t in d["tasks"] if t["done"])
+    try:
+        w = min(os.get_terminal_size().columns, 46)
+    except OSError:
+        w = 44
+    inner = w - 2                                  # место между боковыми гранями
+    today = date.today()
+    head = f" ЗАДАЧИ · {today.day} {MONTHS[today.month - 1]} "
+    out = ["\033[H\033[J",
+           f"{A['frame']}┌{head}{'─' * max(0, inner - len(head))}┐{A['off']}"]
+
+    if not items:
+        line = " всё сделано"
+        out.append(f"{A['frame']}│{A['off']}{A['done']}{line}{A['off']}"
+                   f"{' ' * max(0, inner - len(line))}{A['frame']}│{A['off']}")
+
+    for t, is_sub in rows:
+        pri = PRI_MARK.get(t.get("pri", 0), "  ")
+        due, hot = due_label(t.get("due"))
+        badge = ""
+        if not is_sub:
+            dn, tot = progress(d, t["id"])
+            if tot:
+                badge = f"{dn}/{tot}"
+        right_txt = f"{badge} {due}".strip() if badge and due else (badge or due)
+        left = ("   └ ○ " if is_sub else " ○ ") + pri + " "
+        right = f"{right_txt} " if right_txt else ""
+        avail = inner - len(left) - len(right)
+        text = t["text"]
+        if len(text) > avail > 1:
+            text = text[: avail - 1] + "…"
+        pad = " " * max(0, avail - len(text))
+        pcol = A["hot"] if t.get("pri") == 2 else A["warn"] if t.get("pri") else ""
+        rcol = A["hot"] if hot == 2 and not badge else \
+               A["warn"] if (hot == 1 or badge) else A["muted"]
+        branch = f"   {A['muted']}└{A['off']} " if is_sub else " "
+        out.append(f"{A['frame']}│{A['off']}{branch}{A['muted']}○{A['off']} "
+                   f"{pcol}{pri}{A['off']} {text}{pad}"
+                   + (f"{rcol}{right_txt}{A['off']} " if right_txt else "")
+                   + f"{A['frame']}│{A['off']}")
+
+    foot = f" {len(items)} в работе · {done_n} готово "
+    out.append(f"{A['frame']}└{'─' * max(0, inner - len(foot))}{foot}┘{A['off']}")
+    print("\n".join(out), flush=True)
+
+
+# ─────────────────────────────── CLI ─────────────────────────────────────
+
+def cli_status():
+    """Для Waybar: считаем дела, а не шаги — подзадачи не раздувают счётчик."""
+    d = load()
+    tops = [t for t in d["tasks"] if t.get("parent") is None and not t["done"]]
+    today = [t for t in tops if t.get("due") and t["due"] <= date.today().isoformat()]
+    cls = "hot" if today else ("some" if tops else "clear")
+    tip = f"Задач в работе: {len(tops)}"
+    if today:
+        tip += f"\nГорит сегодня: {len(today)}"
+    for t in order(tops)[:5]:
+        due, _ = due_label(t.get("due"))
+        dn, tot = progress(d, t["id"])
+        line = f"\n• {t['text'][:38]}"
+        if tot:
+            line += f" ({dn}/{tot})"
+        if due:
+            line += f" — {due}"
+        tip += line
+    print(json.dumps({"text": f" {len(tops)}" if tops else "",
+                      "class": cls,
+                      "tooltip": tip + "\nЛКМ — открыть задачник"},
+                     ensure_ascii=False))
+
+
+def cli_list():
+    d = load()
+    for t, is_sub in flatten(d):
+        due, _ = due_label(t.get("due"))
+        dn, tot = (0, 0) if is_sub else progress(d, t["id"])
+        tail = f"   [{due}]" if due else ""
+        if tot:
+            tail = f"   {dn}/{tot}" + tail
+        print(f"{t['id']:>3}  {'  └ ' if is_sub else ''}"
+              f"{'✓' if t['done'] else '○'} {PRI_MARK[t.get('pri',0)]} {t['text']}{tail}")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        try:
+            curses.wrapper(tui)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print("\n\033[31mЗадачник упал.\033[0m Данные целы: " + DATA)
+            try:
+                input("Нажми Enter, чтобы закрыть окно…")
+            except EOFError:
+                pass
+            sys.exit(1)
+    elif a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+    elif a[0] == "--widget":
+        widget()
+    elif a[0] == "--status":
+        cli_status()
+    elif a[0] == "list":
+        cli_list()
+    elif a[0] == "add" and len(a) > 1:
+        d = load()
+        text = " ".join(a[1:])
+        pri = 2 if text.startswith("!!") else 1 if text.startswith("!") else 0
+        text = text.lstrip("! ")
+        due = None
+        if m := re.search(r"@(\S+)$", text):
+            due = parse_due(m.group(1))
+            text = text[: m.start()].strip()
+        t = add_task(d, text, pri, due)
+        save(d)
+        print(f"добавлено #{t['id']}: {t['text']}")
+    elif a[0] == "quickadd":
+        # быстрый ввод через wofi: Super+Shift+T, окно задачника не открывается
+        style = os.path.expanduser("~/.config/wofi/style.css")
+        cmd = ["wofi", "--dmenu", "--prompt", "Новая задача", "--width", "560",
+               "--height", "60", "--lines", "0", "--cache-file", "/dev/null"]
+        if os.path.exists(style):
+            cmd += ["--style", style]
+        r = subprocess.run(cmd, input="", capture_output=True, text=True)
+        text = r.stdout.strip()
+        if not text:
+            return
+        d = load()
+        pri = 2 if text.startswith("!!") else 1 if text.startswith("!") else 0
+        text = text.lstrip("! ")
+        due = None
+        if m := re.search(r"@(\S+)$", text):
+            due = parse_due(m.group(1))
+            text = text[: m.start()].strip()
+        tk = add_task(d, text, pri, due)
+        save(d)
+        subprocess.run(["notify-send", "-a", "Задачи", "-i", "task-due",
+                        "Задача добавлена", tk["text"]], stderr=subprocess.DEVNULL)
+    elif a[0] == "sub" and len(a) > 2:
+        d = load()
+        parent = next((x for x in d["tasks"] if str(x["id"]) == a[1]), None)
+        if not parent:
+            print(f"нет задачи #{a[1]}", file=sys.stderr)
+            sys.exit(1)
+        if parent.get("parent") is not None:
+            parent = next((x for x in d["tasks"] if x["id"] == parent["parent"]), parent)
+        tk = add_task(d, " ".join(a[2:]), parent=parent["id"])
+        parent["done"] = False
+        save(d)
+        print(f"подзадача #{tk['id']} к «{parent['text']}»: {tk['text']}")
+    elif a[0] in ("rm", "remove", "убрать") and len(a) > 1:
+        d = load()
+        tk = next((x for x in d["tasks"] if str(x["id"]) == a[1]), None)
+        if not tk:
+            print(f"нет задачи #{a[1]}", file=sys.stderr)
+            sys.exit(1)
+        n = to_trash(d, tk)
+        save(d)
+        print(f"убрано ({n}): {tk['text']}   ·   вернуть: tasks restore")
+    elif a[0] == "restore":
+        d = load()
+        n = from_trash(d)
+        save(d)
+        print(f"возвращено задач: {n}" if n else "корзина пуста")
+    elif a[0] == "--trash":
+        d = load()
+        if not d.get("trash"):
+            print("корзина пуста")
+        for i, group in enumerate(reversed(d["trash"]), 1):
+            head = group[0]
+            print(f"{i:>3}  {head['text']}" + (f"  (+{len(group)-1} подзадач)"
+                                               if len(group) > 1 else ""))
+    elif a[0] == "done" and len(a) > 1:
+        d = load()
+        for t in d["tasks"]:
+            if str(t["id"]) == a[1]:
+                set_done(d, t, True)
+                save(d)
+                print(f"готово: {t['text']}")
+                return
+        print(f"нет задачи #{a[1]}", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(__doc__, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

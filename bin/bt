@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""bt — менеджер Bluetooth в терминале.
+
+  bt              открыть панель
+  bt --toggle     открыть, а если уже открыта — закрыть (клик по значку)
+  bt status       коротко в stdout: что подключено и сколько в нём заряда
+
+Всё, зачем обычно открывают blueman: сопряжение, подключение, доверие,
+удаление, поиск новых устройств, видимость для чужих, заряд наушников и
+переключение звука на них. Работает через bluetoothctl, поэтому устройства
+общие с системой. Цвета — из палитры терминала, её задаёт wallpick.
+"""
+import curses, locale, os, re, subprocess, sys, time
+
+locale.setlocale(locale.LC_ALL, "")
+
+CLASS = "bt-widget"
+SIBLINGS = ("wifi-widget",)        # соседняя панель: открываем по одной
+
+RU2EN = str.maketrans(
+    "йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,",
+    "qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?")
+
+
+def key(ch):
+    """Нажатие → латинский эквивалент; латиницу и знаки не трогаем."""
+    if isinstance(ch, str) and ch and ("а" <= ch.lower() <= "я" or ch.lower() == "ё"):
+        return ch.translate(RU2EN)
+    return ch
+
+
+# ─── bluetoothctl ───────────────────────────────────────────────────────────
+def bctl(*args, timeout=8, feed=None):
+    """Разовая команда bluetoothctl. feed — ответы агенту при сопряжении."""
+    try:
+        r = subprocess.run(["bluetoothctl", *args], capture_output=True,
+                           text=True, timeout=timeout, input=feed or "")
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired as e:
+        return 124, (e.stdout or "") if isinstance(e.stdout, str) else "", "долго не отвечает"
+    except FileNotFoundError:
+        return 127, "", "bluetoothctl не установлен"
+
+
+TYPES = {
+    "audio-headset": "наушники", "audio-headphones": "наушники",
+    "audio-card": "звук", "multimedia-player": "плеер",
+    "input-keyboard": "клавиатура", "input-mouse": "мышь",
+    "input-gaming": "геймпад", "input-tablet": "планшет",
+    "phone": "телефон", "computer": "компьютер", "printer": "принтер",
+    "camera-photo": "камера", "camera-video": "камера", "scanner": "сканер",
+    "video-display": "экран", "watch": "часы", "network-wireless": "сеть",
+}
+
+
+def adapter():
+    """Состояние контроллера: включён, ищет ли, видим ли для других."""
+    out = bctl("show")[1]
+    val = lambda k: (re.search(rf"^\s*{k}:\s*(\S+)", out, re.M) or [None, ""])[1]
+    name = (re.search(r"^\s*Alias:\s*(.+)$", out, re.M) or [None, ""])[1].strip()
+    return {"present": bool(out.strip()) and "No default controller" not in out,
+            "power": val("Powered") == "yes",
+            "scan": val("Discovering") == "yes",
+            "visible": val("Discoverable") == "yes",
+            "name": name}
+
+
+def mac_list(*args):
+    out = bctl("devices", *args)[1]
+    return [m.group(1) for m in re.finditer(r"^Device ([0-9A-F:]{17})", out, re.M)]
+
+
+def devices():
+    """Все известные и найденные устройства: mac → имя."""
+    out = bctl("devices")[1]
+    return {m.group(1): m.group(2).strip()
+            for m in re.finditer(r"^Device ([0-9A-F:]{17}) (.+)$", out, re.M)}
+
+
+def dev_info(mac):
+    out = bctl("info", mac)[1]
+    val = lambda k: (re.search(rf"^\s*{k}:\s*(.+)$", out, re.M) or [None, ""])[1].strip()
+    bat = re.search(r"Battery Percentage:.*\((\d+)\)", out)
+    return {"alias": val("Alias") or val("Name"),
+            "icon": val("Icon"),
+            "type": TYPES.get(val("Icon"), ""),
+            "battery": int(bat.group(1)) if bat else None,
+            "paired": val("Paired") == "yes",
+            "trusted": val("Trusted") == "yes",
+            "connected": val("Connected") == "yes"}
+
+
+def dev_path(mac):
+    return "/org/bluez/hci0/dev_" + mac.replace(":", "_")
+
+
+def rename(mac, alias):
+    """Своё имя для устройства — через свойство bluez, bluetoothctl так не умеет."""
+    try:
+        r = subprocess.run(["busctl", "set-property", "org.bluez", dev_path(mac),
+                            "org.bluez.Device1", "Alias", "s", alias],
+                           capture_output=True, text=True, timeout=8)
+        return r.returncode, r.stderr.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 1, "не получилось переименовать"
+
+
+# ─── звук ───────────────────────────────────────────────────────────────────
+def sinks():
+    """Выходы звука из wireplumber: [(id, имя, он ли сейчас по умолчанию)]."""
+    try:
+        out = subprocess.run(["wpctl", "status"], capture_output=True,
+                             text=True, timeout=6).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    block = re.search(r"Sinks:(.*?)\n\s*│\s*\n", out, re.S)
+    if not block:
+        return []
+    res = []
+    for line in block.group(1).splitlines():
+        m = re.search(r"(\*?)\s*(\d+)\.\s+(.+?)\s*\[vol", line)
+        if m:
+            res.append((m.group(2), m.group(3).strip(), "*" in line.split(".")[0]))
+    return res
+
+
+def audio_sink_of(name):
+    """Выход звука, принадлежащий устройству: ищем по имени."""
+    for sid, sname, is_def in sinks():
+        if name and name[:18].lower() in sname.lower():
+            return sid, is_def
+    return None, False
+
+
+def make_default_sink(name):
+    sid, is_def = audio_sink_of(name)
+    if not sid:
+        return "у устройства нет выхода звука"
+    if is_def:
+        return "и так звучит здесь"
+    try:
+        subprocess.run(["wpctl", "set-default", sid], timeout=6)
+        return "звук переключён на устройство"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "wpctl не ответил"
+
+
+# ─── действия ───────────────────────────────────────────────────────────────
+def fail_reason(out):
+    m = re.search(r"(Failed to \w+|org\.bluez\.Error\.\w+)[:\s]*(.*)", out or "")
+    if not m:
+        return "не вышло"
+    txt = (m.group(2) or m.group(1)).strip().lower()
+    table = {"authentication failed": "не сошлась авторизация",
+             "page timeout": "устройство не отвечает — включи его и поднеси ближе",
+             "already exists": "пара уже есть",
+             "in progress": "занято, попробуй ещё раз",
+             "не удалось": "не вышло",
+             "protocol not available": "устройство не поддерживает это",
+             "connection refused": "устройство отказало",
+             "br-connection-canceled": "соединение сорвалось",
+             "br-connection-page-timeout": "устройство не отвечает"}
+    for k, v in table.items():
+        if k in txt:
+            return v
+    return (txt or "не вышло")[:52]
+
+
+def do_connect(mac):
+    code, out, _ = bctl("connect", mac, timeout=25)
+    return "подключено" if "Connection successful" in out else fail_reason(out)
+
+
+def do_disconnect(mac):
+    code, out, _ = bctl("disconnect", mac, timeout=15)
+    return "отключено" if "Successful disconnected" in out or code == 0 else fail_reason(out)
+
+
+def do_pair(mac):
+    """Сопряжение: свой агент отвечает «да» на запрос подтверждения."""
+    feed = f"agent on\ndefault-agent\npair {mac}\nyes\nyes\ntrust {mac}\nconnect {mac}\nquit\n"
+    code, out, _ = bctl(timeout=45, feed=feed)
+    if "Pairing successful" in out or "AlreadyExists" in out:
+        return "пара готова" + (" и подключено" if "Connection successful" in out else "")
+    return fail_reason(out)
+
+
+# ─── отрисовка ──────────────────────────────────────────────────────────────
+C_FRAME, C_TEXT, C_MUTED, C_GOOD, C_WARN, C_BAD, C_SEL, C_HINT = range(1, 9)
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()            # прозрачный фон — виден блюр kitty
+    curses.init_pair(C_FRAME, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_TEXT,  -1, -1)
+    curses.init_pair(C_MUTED, 8, -1)
+    curses.init_pair(C_GOOD,  curses.COLOR_GREEN, -1)
+    curses.init_pair(C_WARN,  curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_BAD,   curses.COLOR_RED, -1)
+    curses.init_pair(C_SEL,   curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_HINT,  8, -1)
+
+
+def put(win, y, x, text, attr=0, width=None):
+    h, w = win.getmaxyx()
+    if not (0 <= y < h) or x >= w - 1:
+        return
+    room = (w - 1 - x) if width is None else min(width, w - 1 - x)
+    try:
+        win.addstr(y, x, text[:room], attr)
+    except curses.error:
+        pass
+
+
+def prompt(win, label, initial=""):
+    h, w = win.getmaxyx()
+    y = h - 2
+    buf = list(initial)
+    curses.curs_set(1)
+    while True:
+        win.move(y, 1)
+        win.clrtoeol()
+        put(win, y, 2, (label + "".join(buf))[-(w - 5):], curses.color_pair(C_TEXT))
+        put(win, y, w - 1, "│", curses.color_pair(C_FRAME))
+        win.refresh()
+        try:
+            ch = win.get_wch()
+        except curses.error:
+            continue
+        if ch in ("\n", "\r", curses.KEY_ENTER, 10, 13):
+            curses.curs_set(0)
+            return "".join(buf).strip()
+        if ch == "\x1b":
+            curses.curs_set(0)
+            return None
+        if ch in ("\x7f", "\b", curses.KEY_BACKSPACE, 263):
+            if buf:
+                buf.pop()
+        elif isinstance(ch, str) and ch.isprintable():
+            buf.append(ch)
+
+
+HELP = [
+    ("↓ ↑  j k", "двигаться по списку"),
+    ("Enter", "подключить, а подключённое — отключить"),
+    ("p", "сопряжение: пара, доверие и подключение"),
+    ("t", "доверять устройству: вкл / выкл"),
+    ("f   Del", "забыть устройство"),
+    ("s", "искать новые: вкл / выкл"),
+    ("w", "Bluetooth целиком: включить / выключить"),
+    ("v", "видимость для чужих устройств на 3 минуты"),
+    ("o", "сделать выходом звука (наушники, колонка)"),
+    ("e", "переименовать по-своему"),
+    ("i", "сведения об устройстве"),
+    ("r", "обновить список"),
+    ("?", "эта справка   ·   q выход"),
+    ("", ""),
+    ("ЛКМ", "выбрать устройство"),
+    ("2×ЛКМ", "подключить, а подключённое — отключить"),
+    ("ПКМ", "меню со всеми действиями"),
+    ("колесо", "листать список"),
+    ("×", "закрыть панель (угол справа вверху)"),
+    ("", ""),
+    ("раскладка", "любая: з=p, е=t, а=f, ы=s, ц=w"),
+]
+
+
+def overlay(win, title, rows):
+    h, w = win.getmaxyx()
+    bw = min(58, max(28, w - 2))
+    vis = rows[: max(1, h - 5)]
+    bh = min(len(vis) + 4, h)
+    box = win.derwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
+    box.erase()
+    box.attrset(curses.color_pair(C_FRAME))
+    box.box()
+    put(box, 0, 2, f" {title} ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+    for i, (k, v) in enumerate(vis, start=2):
+        if i >= bh - 1:
+            break
+        put(box, i, 3, f"{k:<11}", curses.color_pair(C_WARN), 12)
+        put(box, i, 15, v, curses.color_pair(C_MUTED), bw - 17)
+    if len(vis) < len(rows):
+        put(box, bh - 1, 2, " окно мало — растяни ", curses.color_pair(C_MUTED))
+    box.refresh()
+    win.get_wch()
+
+
+def refresh(st):
+    """Собираем список: подключённые сверху, потом пары, потом найденные."""
+    ad = adapter()
+    st["ad"] = ad
+    if not ad["power"]:
+        st["rows"], st["stamp"] = [], time.time()
+        return
+    names = devices()
+    paired, conn, trust = set(mac_list("Paired")), set(mac_list("Connected")), set(mac_list("Trusted"))
+    rows = []
+    for mac, name in names.items():
+        info = st["cache"].get(mac)
+        fresh = info and time.time() - info["ts"] < 4
+        if not fresh:
+            info = dev_info(mac)
+            info["ts"] = time.time()
+            st["cache"][mac] = info
+        rows.append({"mac": mac, "name": info["alias"] or name,
+                     "type": info["type"], "battery": info["battery"],
+                     "paired": mac in paired or info["paired"],
+                     "trusted": mac in trust or info["trusted"],
+                     "conn": mac in conn or info["connected"]})
+    rank = lambda r: (not r["conn"], not r["paired"], r["name"].lower())
+    rows.sort(key=rank)
+    st["rows"] = rows
+    st["sinkmap"] = {r["mac"]: audio_sink_of(r["name"]) for r in rows if r["conn"]}
+    st["stamp"] = time.time()
+
+
+def menu(win, my, mx, items, title=""):
+    """Всплывающее меню: выбрать можно и мышью, и клавишами. → действие или None.
+
+    Пункт («подпись», «действие»); действие None — это разделитель."""
+    h, w = win.getmaxyx()
+    bw = min(max(len(t) for t, _ in items) + 6, max(20, w - 2))
+    bh = min(len(items) + 2, h)
+    y = max(0, min(my, h - bh))
+    x = max(0, min(mx, w - bw))
+    box = win.derwin(bh, bw, y, x)
+    sel = next((i for i, (_, a) in enumerate(items) if a), 0)
+
+    while True:
+        box.erase()
+        box.attrset(curses.color_pair(C_FRAME))
+        box.box()
+        if title:
+            put(box, 0, 2, f" {title} ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+        for i, (text, action) in enumerate(items):
+            row = 1 + i
+            if row >= bh - 1:
+                break
+            if action is None:
+                put(box, row, 1, "─" * (bw - 2), curses.color_pair(C_MUTED))
+                continue
+            attr = curses.color_pair(C_TEXT)
+            if i == sel:
+                attr = curses.color_pair(C_SEL) | curses.A_BOLD
+            put(box, row, 2, ("▸ " if i == sel else "  ") + text, attr, bw - 4)
+        box.refresh()
+
+        try:
+            ch = key(win.get_wch())
+        except curses.error:
+            continue
+        if ch == curses.KEY_MOUSE:
+            try:
+                _, cx, cy, _, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            if not (y <= cy < y + bh and x <= cx < x + bw):
+                return None                      # клик мимо — просто закрыть
+            i = cy - y - 1
+            if 0 <= i < len(items) and items[i][1]:
+                if bstate & (curses.BUTTON1_RELEASED | curses.BUTTON1_PRESSED
+                             | curses.BUTTON3_PRESSED | curses.BUTTON3_RELEASED):
+                    return items[i][1]
+                sel = i
+            continue
+        if ch in ("q", "Q", "\x1b"):
+            return None
+        if ch in ("j", curses.KEY_DOWN):
+            nxt = [i for i, (_, a) in enumerate(items) if a and i > sel]
+            sel = nxt[0] if nxt else sel
+        elif ch in ("k", curses.KEY_UP):
+            prv = [i for i, (_, a) in enumerate(items) if a and i < sel]
+            sel = prv[-1] if prv else sel
+        elif ch in ("\n", "\r", curses.KEY_ENTER):
+            return items[sel][1]
+
+
+def ask_yes(stdscr, question):
+    """Да/нет — мышью тоже: маленькое меню по центру."""
+    h, w = stdscr.getmaxyx()
+    return menu(stdscr, h // 2 - 2, max(2, w // 2 - 14),
+                [("Да", "yes"), ("Отмена", "no")], question) == "yes"
+
+
+def draw(stdscr, st):
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    stdscr.attrset(curses.color_pair(C_FRAME))
+    stdscr.box()
+    put(stdscr, 0, 2, " BLUETOOTH ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+    put(stdscr, 0, w - 5, " × ", curses.color_pair(C_MUTED))
+    st["zones"] = {"quit": (0, w - 5, w - 3)}          # кнопка: строка, слева, справа
+
+    ad = st["ad"]
+    if not ad["present"]:
+        head, hattr = " адаптера нет ", C_BAD
+    elif not ad["power"]:
+        head, hattr = " выключен ", C_BAD
+    else:
+        n = sum(1 for r in st["rows"] if r["conn"])
+        bits = [f"подключено: {n}" if n else "включён"]
+        if ad["scan"]:
+            bits.append("ищу…")
+        if ad["visible"]:
+            bits.append("видим")
+        head, hattr = " " + " · ".join(bits) + " ", C_GOOD if n else C_MUTED
+    hx = max(13, w - len(head) - 6)
+    put(stdscr, 0, hx, head, curses.color_pair(hattr))
+    st["zones"]["power"] = (0, hx, hx + len(head))     # клик по состоянию — вкл/выкл
+
+    rows, body_h = st["rows"], h - 4
+    st["sel"] = max(0, min(st["sel"], len(rows) - 1))
+    top = max(0, st["sel"] - body_h + 2) if st["sel"] >= body_h else 0
+    st["rowmap"] = {}
+
+    if not ad["power"]:
+        msg = "Bluetooth выключен — нажми «w» или щёлкни по надписи справа вверху"
+        put(stdscr, h // 2, max(2, (w - len(msg)) // 2), msg, curses.color_pair(C_MUTED))
+    elif not rows:
+        msg = "устройств нет — «s» искать новые"
+        put(stdscr, h // 2, max(2, (w - len(msg)) // 2), msg, curses.color_pair(C_MUTED))
+
+    for i, r in enumerate(rows[top: top + body_h]):
+        y, idx = 2 + i, top + i
+        st["rowmap"][y] = idx
+        is_sel = idx == st["sel"]
+        put(stdscr, y, 2, "▸ " if is_sel else "  ",
+            curses.color_pair(C_SEL) | curses.A_BOLD)
+        mark, mattr = ("●", C_GOOD) if r["conn"] else \
+                      ("○", C_MUTED) if r["paired"] else ("·", C_MUTED)
+        put(stdscr, y, 4, mark, curses.color_pair(mattr))
+
+        tail = []
+        if r["conn"] and st["sinkmap"].get(r["mac"], (None, False))[1]:
+            tail.append("♪")
+        if r["battery"] is not None:
+            tail.append(f"{r['battery']}%")
+        if r["trusted"]:
+            tail.append("★")
+        tail.append(r["type"] or ("пара" if r["paired"] else "новое"))
+        tail = "  ".join(tail)
+
+        x, avail = 6, w - 6 - len(tail) - 3
+        name = r["name"]
+        if len(name) > avail > 1:
+            name = name[: avail - 1] + "…"
+        attr = curses.color_pair(C_TEXT)
+        if r["conn"]:
+            attr = curses.color_pair(C_GOOD) | curses.A_BOLD
+        elif not r["paired"]:
+            attr = curses.color_pair(C_MUTED)
+        elif is_sel:
+            attr |= curses.A_BOLD
+        put(stdscr, y, x, name, attr)
+        battr = C_BAD if (r["battery"] is not None and r["battery"] <= 15) else \
+                C_WARN if r["conn"] else C_MUTED
+        put(stdscr, y, max(x + 1, w - len(tail) - 3), tail, curses.color_pair(battr))
+
+    hint = st["msg"] or "ЛКМ выбрать · 2×ЛКМ подключить · ПКМ меню · ? клавиши"
+    put(stdscr, h - 2, 2, hint, curses.color_pair(C_WARN if st["msg"] else C_HINT), w - 4)
+    st["zones"]["menu"] = (h - 2, 2, w - 3)            # клик по подсказке — меню
+    stdscr.refresh()
+
+
+def info_rows(r):
+    info = dev_info(r["mac"])
+    sid, is_def = audio_sink_of(r["name"])
+    return [("имя", r["name"]), ("адрес", r["mac"]),
+            ("тип", info["type"] or info["icon"] or "неизвестно"),
+            ("состояние", "подключено" if info["connected"] else
+                          "пара есть" if info["paired"] else "просто найдено"),
+            ("доверие", "да" if info["trusted"] else "нет"),
+            ("заряд", f"{info['battery']}%" if info["battery"] is not None else "не сообщает"),
+            ("звук", ("выход звука · выбран" if is_def else "выход звука")
+                     if sid else "не выход звука")]
+
+
+def scan_start(st):
+    if st["scanner"] and st["scanner"].poll() is None:
+        return
+    st["scanner"] = subprocess.Popen(["bluetoothctl", "scan", "on"],
+                                     stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+
+
+def scan_stop(st):
+    p = st.get("scanner")
+    if p and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    st["scanner"] = None
+    bctl("scan", "off", timeout=5)
+
+
+def scanning(st):
+    return st["ad"]["scan"] or bool(st["scanner"] and st["scanner"].poll() is None)
+
+
+def row_menu(st):
+    """Меню для выбранного устройства — тем же набором, что и клавиши."""
+    cur = st["rows"][st["sel"]] if st["rows"] else None
+    items = []
+    if cur:
+        if cur["conn"]:
+            items.append(("Отключить", "disconnect"))
+            items.append(("Сделать выходом звука", "sink"))
+        elif cur["paired"]:
+            items.append(("Подключить", "connect"))
+        else:
+            items.append(("Сделать пару и подключить", "pair"))
+        items.append(("Не доверять" if cur["trusted"] else "Доверять (само подключится)", "trust"))
+        items.append(("Переименовать", "rename"))
+        items.append(("Забыть устройство", "forget"))
+        items.append(("Сведения", "info"))
+        items.append(("-", None))
+    items += [("Не искать новые" if scanning(st) else "Искать новые", "scan"),
+              ("Спрятаться от чужих" if st["ad"]["visible"] else "Показаться чужим (3 мин)", "visible"),
+              ("Bluetooth " + ("выключить" if st["ad"]["power"] else "включить"), "power"),
+              ("Обновить список", "reload"),
+              ("-", None),
+              ("Клавиши", "help"),
+              ("Закрыть панель", "quit")]
+    return items
+
+
+def act(stdscr, st, action):
+    """Одно действие — неважно, откуда пришло: с клавиши, из меню или мышью."""
+    cur = st["rows"][st["sel"]] if st["rows"] else None
+
+    if action == "quit":
+        return True
+
+    if action in ("connect", "disconnect", "pair") and cur:
+        if action == "disconnect" or (action == "connect" and cur["conn"]):
+            st["msg"] = f"отключаю {cur['name']}…"
+            draw(stdscr, st)
+            st["msg"] = do_disconnect(cur["mac"])
+        elif cur["paired"] and action != "pair":
+            st["msg"] = f"подключаю {cur['name']}…"
+            draw(stdscr, st)
+            st["msg"] = do_connect(cur["mac"])
+        else:
+            st["msg"] = f"делаю пару с «{cur['name']}»…"
+            draw(stdscr, st)
+            st["msg"] = do_pair(cur["mac"])
+        st["cache"].pop(cur["mac"], None)
+        refresh(st)
+
+    elif action == "trust" and cur:
+        bctl("untrust" if cur["trusted"] else "trust", cur["mac"])
+        st["msg"] = "доверие снято" if cur["trusted"] else "доверяем — подключится само"
+        st["cache"].pop(cur["mac"], None)
+        refresh(st)
+
+    elif action == "forget" and cur:
+        if ask_yes(stdscr, f"Забыть «{cur['name']}»?"):
+            code, out, _ = bctl("remove", cur["mac"], timeout=15)
+            st["msg"] = "забыли" if "removed" in out.lower() or code == 0 else fail_reason(out)
+            st["cache"].pop(cur["mac"], None)
+            refresh(st)
+        else:
+            st["msg"] = "отменено"
+
+    elif action == "sink" and cur:
+        st["msg"] = make_default_sink(cur["name"]) if cur["conn"] \
+            else "сначала подключи устройство"
+        refresh(st)
+
+    elif action == "rename" and cur:
+        new = prompt(stdscr, "новое имя: ", cur["name"])
+        if not new:
+            st["msg"] = "отменено"
+        else:
+            code, err = rename(cur["mac"], new)
+            st["msg"] = "переименовано" if code == 0 else (err or "не вышло")[:52]
+            st["cache"].pop(cur["mac"], None)
+            refresh(st)
+
+    elif action == "scan":
+        if scanning(st):
+            scan_stop(st)
+            st["msg"] = "поиск остановлен"
+        else:
+            scan_start(st)
+            st["msg"] = "ищу новые устройства — включи их и жди"
+        time.sleep(0.4)
+        refresh(st)
+
+    elif action == "power":
+        new = "off" if st["ad"]["power"] else "on"
+        if new == "off":
+            scan_stop(st)
+        bctl("power", new, timeout=10)
+        st["msg"] = "Bluetooth " + ("выключен" if new == "off" else "включён")
+        st["cache"].clear()
+        time.sleep(0.8)
+        refresh(st)
+
+    elif action == "visible":
+        new = "off" if st["ad"]["visible"] else "on"
+        bctl("pairable", new, timeout=8)
+        bctl("discoverable", new, timeout=8)
+        st["msg"] = ("видимы для чужих устройств (3 минуты)" if new == "on"
+                     else "больше не видимы")
+        refresh(st)
+
+    elif action == "reload":
+        st["cache"].clear()
+        refresh(st)
+        st["msg"] = f"устройств в списке: {len(st['rows'])}"
+
+    elif action == "info" and cur:
+        overlay(stdscr, "УСТРОЙСТВО", info_rows(cur))
+
+    elif action == "help":
+        overlay(stdscr, "КЛАВИШИ И МЫШЬ", HELP)
+
+    return False
+
+
+def hit(st, name, cy, cx):
+    z = st["zones"].get(name)
+    return bool(z) and cy == z[0] and z[1] <= cx <= z[2]
+
+
+def on_mouse(stdscr, st):
+    """Мышь: выбор, двойной клик — подключить, правая — меню, колесо — прокрутка."""
+    try:
+        _, cx, cy, _, bstate = curses.getmouse()
+    except curses.error:
+        return False
+    up = curses.BUTTON4_PRESSED
+    down = getattr(curses, "BUTTON5_PRESSED", 0x200000)
+    if bstate & up:
+        st["sel"] = max(0, st["sel"] - 3)
+        return False
+    if bstate & down:
+        st["sel"] = min(len(st["rows"]) - 1, st["sel"] + 3)
+        return False
+
+    right = bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_RELEASED
+                      | curses.BUTTON3_CLICKED)
+    if cy in st["rowmap"]:
+        st["sel"] = st["rowmap"][cy]
+    if right:
+        choice = menu(stdscr, cy, cx, row_menu(st), "ДЕЙСТВИЯ")
+        return act(stdscr, st, choice) if choice else False
+    if hit(st, "quit", cy, cx):
+        return True
+    if hit(st, "power", cy, cx):
+        return act(stdscr, st, "power")
+    if hit(st, "menu", cy, cx):
+        choice = menu(stdscr, max(0, cy - len(row_menu(st)) - 1), cx,
+                      row_menu(st), "ДЕЙСТВИЯ")
+        return act(stdscr, st, choice) if choice else False
+
+    if cy in st["rowmap"]:                       # двойной клик — подключить
+        now = time.time()
+        same = st.get("click") == (st["sel"],) and now - st.get("click_at", 0) < 0.5
+        st["click"], st["click_at"] = (st["sel"],), now
+        if same or bstate & curses.BUTTON1_DOUBLE_CLICKED:
+            cur = st["rows"][st["sel"]]
+            return act(stdscr, st, "disconnect" if cur["conn"] else "connect")
+    return False
+
+
+def tui(stdscr):
+    curses.curs_set(0)
+    try: curses.set_escdelay(25)      # иначе Esc срабатывает через секунду
+    except Exception: pass
+    init_colors()
+    stdscr.keypad(True)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    curses.mouseinterval(200)
+    st = {"rows": [], "cache": {}, "sinkmap": {}, "ad": adapter(), "sel": 0,
+          "msg": "", "stamp": 0, "scanner": None, "zones": {}, "rowmap": {}}
+    refresh(st)
+    # ищем новое сразу, но только если музыке это не помешает
+    if st["ad"]["power"] and not any(r["conn"] for r in st["rows"]):
+        scan_start(st)
+
+    try:
+        while True:
+            draw(stdscr, st)
+            st["msg"] = ""
+            stdscr.timeout(1500)
+            try:
+                ch = stdscr.get_wch()
+            except curses.error:
+                ch = -1
+            if ch == -1:
+                refresh(st)
+                continue
+            ch = key(ch)
+            stdscr.timeout(-1)
+
+            if ch == curses.KEY_MOUSE:
+                if on_mouse(stdscr, st):
+                    break
+                continue
+            if ch in ("q", "Q", "\x1b"):
+                break
+            elif ch in ("j", curses.KEY_DOWN):
+                st["sel"] += 1
+            elif ch in ("k", curses.KEY_UP):
+                st["sel"] -= 1
+            elif ch == curses.KEY_HOME:
+                st["sel"] = 0
+            elif ch == curses.KEY_END:
+                st["sel"] = len(st["rows"]) - 1
+            elif ch == curses.KEY_NPAGE:
+                st["sel"] += 5
+            elif ch == curses.KEY_PPAGE:
+                st["sel"] -= 5
+            else:
+                keymap = {"\n": "connect", "\r": "connect", curses.KEY_ENTER: "connect",
+                          "p": "pair", "P": "pair", "t": "trust", "T": "trust",
+                          "f": "forget", "F": "forget", curses.KEY_DC: "forget",
+                          "s": "scan", "S": "scan", "w": "power", "W": "power",
+                          "v": "visible", "V": "visible", "o": "sink", "O": "sink",
+                          "e": "rename", "E": "rename", "i": "info", "I": "info",
+                          "r": "reload", "R": "reload", curses.KEY_F5: "reload",
+                          "?": "help", "/": "help"}
+                action = keymap.get(ch)
+                if action and act(stdscr, st, action):
+                    break
+    finally:
+        scan_stop(st)
+
+
+# ─── окно ───────────────────────────────────────────────────────────────────
+def hypr(*args):
+    try:
+        return subprocess.run(["hyprctl", *args], capture_output=True,
+                              text=True).stdout
+    except FileNotFoundError:
+        return ""
+
+
+def toggle():
+    """Второй клик по значку закрывает панель. Соседнюю панель убираем."""
+    import json
+    try:
+        clients = json.loads(hypr("clients", "-j"))
+        active_ws = json.loads(hypr("activeworkspace", "-j"))["id"]
+    except (ValueError, KeyError):
+        clients, active_ws = [], None
+
+    for c in clients:
+        if c.get("class") in SIBLINGS:
+            hypr("dispatch", "closewindow", f"address:{c['address']}")
+
+    mine = [c for c in clients if c.get("class") == CLASS]
+    here = [c for c in mine if c.get("workspace", {}).get("id") == active_ws]
+    if here:
+        for c in here:
+            hypr("dispatch", "closewindow", f"address:{c['address']}")
+    elif mine:
+        hypr("dispatch", "movetoworkspace", f"{active_ws},address:{mine[0]['address']}")
+        hypr("dispatch", "focuswindow", f"address:{mine[0]['address']}")
+    else:
+        subprocess.Popen(["kitty", "--class", CLASS, "-e",
+                          os.path.abspath(__file__)], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cli_status():
+    ad = adapter()
+    if not ad["present"]:
+        print("адаптера нет")
+        return
+    if not ad["power"]:
+        print("Bluetooth выключен")
+        return
+    conn = mac_list("Connected")
+    if not conn:
+        print("включён, ничего не подключено")
+        return
+    parts = []
+    for mac in conn:
+        i = dev_info(mac)
+        parts.append(i["alias"] + (f" · {i['battery']}%" if i["battery"] is not None else ""))
+    print(" | ".join(parts))
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "--toggle":
+        toggle()
+    elif arg == "status":
+        cli_status()
+    elif arg in ("-h", "--help"):
+        print(__doc__)
+    else:
+        try:
+            curses.wrapper(tui)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            try:
+                input("Нажми Enter, чтобы закрыть…")
+            except EOFError:
+                pass
+
+
+if __name__ == "__main__":
+    main()

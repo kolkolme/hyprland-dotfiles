@@ -1,0 +1,93 @@
+# Starship — приглашение в стиле Waybar (Catppuccin Mocha, mauve → pink)
+"$schema" = 'https://starship.rs/config-schema.json'
+
+add_newline = false          # пустую строку перед приглашением уже печатает Kali-.zshrc
+palette = "mocha"
+
+format = """
+[](mauve)$os$username$hostname[](fg:mauve bg:pink)$directory[](fg:pink bg:surface0)$git_branch$git_status$python[](fg:surface0)
+$character"""
+
+right_format = "$cmd_duration$status$jobs"
+
+[os]
+disabled = false
+style = "bg:mauve fg:crust"
+format = "[$symbol ]($style)"
+[os.symbols]
+Kali = "󰈸"
+Linux = ""
+
+[username]
+show_always = true
+style_user = "bg:mauve fg:crust bold"
+style_root = "bg:red fg:crust bold"
+format = "[$user ]($style)"
+
+[hostname]
+ssh_only = true
+style = "bg:mauve fg:crust"
+format = "[@$hostname]($style)"
+
+[directory]
+style = "bg:pink fg:crust bold"
+format = "[ $path ]($style)[$read_only]($read_only_style)"
+read_only = "󰌾 "
+read_only_style = "bg:pink fg:red"
+truncation_length = 4
+truncation_symbol = "…/"
+home_symbol = "~"
+[directory.substitutions]
+"Downloads" = "󰇚 Downloads"
+"Pictures"  = " Pictures"
+"Documents" = "󰈙 Documents"
+
+[git_branch]
+symbol = ""
+style = "bg:surface0 fg:mauve"
+format = "[ $symbol $branch ]($style)"
+
+[git_status]
+style = "bg:surface0 fg:peach"
+format = "[($all_status$ahead_behind )]($style)"
+
+[python]
+symbol = ""
+style = "bg:surface0 fg:yellow"
+format = "[ $symbol ($virtualenv )]($style)"
+detect_extensions = []
+detect_files = []
+
+[character]
+success_symbol = "[❯](bold pink)"
+error_symbol   = "[❯](bold red)"
+vimcmd_symbol  = "[❮](bold green)"
+
+[cmd_duration]
+min_time = 2000
+style = "fg:yellow"
+format = "[ $duration]($style) "
+
+[status]
+disabled = false
+style = "fg:red"
+format = "[✘ $status]($style) "
+
+[jobs]
+style = "fg:blue"
+format = "[ $number]($style) "
+
+[palettes.mocha]
+rosewater = "#f5e0dc"
+pink      = "#d7ccd4"
+mauve     = "#c7b3c5"
+red       = "#f38ba8"
+peach     = "#fab387"
+yellow    = "#f9e2af"
+green     = "#a6e3a1"
+teal      = "#94e2d5"
+blue      = "#89b4fa"
+text      = "#e2dfe2"
+surface0  = "#3c393c"
+base      = "#272527"
+crust     = "#171517"

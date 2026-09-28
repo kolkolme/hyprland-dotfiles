@@ -1,0 +1,472 @@
+/* swaync — центр уведомлений в одном стиле с Waybar и wofi.
+ *
+ * Палитра — единственное место с hex-кодами: их перекрашивает wallpick вместе
+ * с остальной системой. Всё остальное выражено через alpha()/mix() от этих
+ * цветов, поэтому новых hex в файле быть не должно.
+ * Селекторы — под swaync 0.12 (GTK 4). */
+
+@define-color crust    #171517;   /* самый тёмный фон */
+@define-color mantle   #1f1e1f;
+@define-color base     #272527;   /* фон панели */
+@define-color surface0 #3c393c;   /* фон карточек */
+@define-color surface1 #514e51;   /* наведение */
+@define-color overlay0 #7b777a;   /* второстепенный текст */
+@define-color overlay1 #666265;
+@define-color subtext  #b8b6b8;   /* текст тела */
+@define-color subtext0 #cdcbcd;
+@define-color text     #e2dfe2;   /* заголовки */
+@define-color accent   #c7b3c5;
+@define-color accent2  #d7ccd4;
+@define-color red      #f38ba8;   /* смысловой цвет, wallpick его не трогает */
+
+* {
+  font-family: "JetBrains Mono", "Font Awesome 7 Free Solid", "Font Awesome 6 Free Solid", monospace;
+  font-size: 13px;
+  text-shadow: none;
+  box-shadow: none;
+}
+
+/* GTK 4 приглушает метки фильтром прозрачности — возвращаем нормальный цвет */
+label { filter: none; }
+
+notificationwindow, blankwindow, .blank-window, .floating-notifications {
+  background: transparent;
+}
+
+/* ─────────────────────────── карточка уведомления ─────────────────────────── */
+
+.notification-row { background: transparent; outline: none; }
+.notification-row:focus, .notification-row:hover { background: transparent; }
+
+.notification-row .notification-background { padding: 5px 10px; }
+
+.notification-row .notification-background .notification {
+  background: alpha(@surface0, 0.55);
+  border: 1px solid alpha(@text, 0.07);
+  border-radius: 14px;
+  padding: 0;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+.notification-row .notification-background .notification:hover {
+  background: alpha(@surface0, 0.8);
+  border-color: alpha(@accent, 0.35);
+}
+
+/* приоритеты: тихое — глуше, важное — с красной гранью слева */
+.notification-row .notification-background .notification.low { background: alpha(@surface0, 0.35); }
+.notification-row .notification-background .notification.critical {
+  background: alpha(@red, 0.12);
+  border-color: alpha(@red, 0.55);
+  border-left: 3px solid @red;
+}
+
+.notification-default-action {
+  padding: 10px 12px;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: @text;
+  border-radius: 14px;
+  transition: background 0.2s ease;
+}
+.notification-default-action:hover { background: alpha(@surface1, 0.35); }
+.notification-default-action:not(:only-child) {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  padding-bottom: 6px;
+}
+
+.notification-content { background: transparent; padding: 0; }
+
+/* значок приложения */
+.notification-content .image {
+  -gtk-icon-size: 42px;
+  border-radius: 10px;
+  margin: 2px 12px 2px 2px;
+}
+.notification-content .app-icon {
+  -gtk-icon-size: 18px;
+  -gtk-icon-shadow: 0 1px 3px alpha(@crust, 0.8);
+  margin: 4px;
+}
+
+/* текст: заголовок — время — тело */
+.notification-content .summary {
+  font-size: 13px;
+  font-weight: bold;
+  color: @text;
+  background: transparent;
+}
+.notification-content .time {
+  font-size: 11px;
+  font-weight: normal;
+  color: @overlay0;
+  background: transparent;
+  margin-right: 24px;   /* место под крестик */
+}
+.notification-content .body {
+  font-size: 12px;
+  color: @subtext;
+  background: transparent;
+  margin-top: 2px;
+}
+.notification.critical .summary { color: @red; }
+
+/* полоса прогресса (громкость, яркость, загрузки) */
+.notification-content progressbar { margin-top: 8px; min-height: 6px; }
+.notification-content progressbar trough {
+  background: alpha(@crust, 0.55);
+  border: none;
+  border-radius: 999px;
+  min-height: 6px;
+}
+.notification-content progressbar progress {
+  background: linear-gradient(90deg, @accent, @accent2);
+  border-radius: 999px;
+  min-height: 6px;
+}
+
+.notification-content .body-image {
+  margin-top: 8px;
+  border-radius: 10px;
+  background: transparent;
+}
+
+/* быстрый ответ прямо из уведомления */
+.inline-reply { margin-top: 8px; }
+.inline-reply .inline-reply-entry {
+  background: alpha(@crust, 0.55);
+  color: @text;
+  caret-color: @accent;
+  border: 1px solid alpha(@text, 0.1);
+  border-radius: 10px;
+  padding: 6px 10px;
+}
+.inline-reply .inline-reply-entry:focus { border-color: alpha(@accent, 0.7); outline: none; }
+.inline-reply .inline-reply-button {
+  margin-left: 6px;
+  padding: 6px 12px;
+  background: alpha(@surface1, 0.55);
+  border: none;
+  border-radius: 10px;
+  color: @text;
+}
+.inline-reply .inline-reply-button:hover { background: alpha(@accent, 0.85); color: @base; }
+.inline-reply .inline-reply-button:disabled { background: transparent; color: @overlay1; }
+
+/* дополнительные действия уведомления */
+.notification-alt-actions {
+  background: transparent;
+  padding: 0 8px 8px;
+  border-bottom-left-radius: 14px;
+  border-bottom-right-radius: 14px;
+}
+.notification-action { margin: 2px; padding: 0; }
+.notification-action > button {
+  background: alpha(@surface1, 0.45);
+  border: none;
+  border-radius: 10px;
+  color: @subtext0;
+  padding: 5px 10px;
+  font-size: 12px;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+.notification-action > button:hover {
+  background: linear-gradient(90deg, @accent, @accent2);
+  color: @base;
+}
+
+/* крестик — появляется при наведении на карточку */
+.close-button {
+  background: alpha(@crust, 0.5);
+  color: @subtext;
+  border: none;
+  border-radius: 999px;
+  margin: 8px 8px 0 0;
+  padding: 0;
+  min-width: 22px;
+  min-height: 22px;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.notification-row:hover .close-button,
+.notification-group:hover .close-button { opacity: 1; }
+.close-button:hover { background: @red; color: @crust; }
+
+/* ───────────────────────── группировка по приложению ──────────────────────── */
+
+.notification-group { background: transparent; transition: opacity 0.2s ease-in-out; }
+.notification-group .notification-group-headers { margin: 10px 18px 0; color: @overlay0; }
+.notification-group .notification-group-headers .notification-group-header {
+  color: @overlay0;
+  font-size: 11px;
+  font-weight: bold;
+}
+.notification-group .notification-group-headers .notification-group-icon {
+  color: @overlay0;
+  -gtk-icon-size: 14px;
+  margin-right: 6px;
+}
+.notification-group .notification-group-buttons { margin: 0 12px; }
+.notification-group .notification-group-close-button .close-button { margin: 8px 16px; }
+.notification-group.collapsed.not-expanded { opacity: 0.45; }
+.notification-group.collapsed .notification-row .notification { background: alpha(@surface0, 0.75); }
+/* карточки под верхней в свёрнутой стопке — нейтральные, без цветных граней */
+.notification-group.collapsed .notification-row:not(:last-child) .notification {
+  background: alpha(@surface0, 0.5);
+  border: 1px solid alpha(@text, 0.07);
+}
+
+/* ───────────────────────────── панель центра ──────────────────────────────── */
+
+.control-center {
+  background: alpha(@base, 0.82);
+  border: 1px solid alpha(@accent, 0.35);
+  border-radius: 18px;
+  color: @text;
+}
+
+/* сброс фонов контейнеров GTK внутри панели */
+.control-center list,
+.control-center listview,
+.control-center row,
+.control-center viewport,
+.control-center scrolledwindow,
+.control-center stack { background: transparent; }
+
+.control-center .control-center-list { background: transparent; padding-bottom: 8px; }
+.control-center .control-center-list-placeholder {
+  color: @overlay1;
+  font-size: 13px;
+  opacity: 1;
+}
+.control-center .control-center-list-placeholder image {
+  -gtk-icon-size: 52px;
+  color: @overlay1;
+  opacity: 0.35;
+  margin-bottom: 6px;
+}
+
+.control-center scrollbar { background: transparent; border: none; }
+.control-center scrollbar slider {
+  background: alpha(@overlay0, 0.4);
+  border: none;
+  border-radius: 999px;
+  min-width: 6px;
+  margin: 2px;
+  transition: background 0.2s ease;
+}
+.control-center scrollbar slider:hover { background: alpha(@accent, 0.75); }
+
+/* в панели карточки чуть плотнее, а тени не нужны — фон и так размыт */
+.control-center .control-center-list .notification { box-shadow: none; }
+
+/* всплывающие уведомления — плотнее и с тенью, они висят поверх окон.
+   Селекторы длинные нарочно: они должны перебивать правила карточек выше. */
+.floating-notifications .notification-row .notification-background .notification {
+  background: alpha(@base, 0.95);
+  border: 1px solid alpha(@accent, 0.4);
+  box-shadow: 0 8px 24px alpha(@crust, 0.65);
+}
+.floating-notifications .notification-row .notification-background .notification:hover {
+  background: alpha(@surface0, 0.97);
+}
+.floating-notifications .notification-row .notification-background .notification.low {
+  background: alpha(@base, 0.92);
+  border-color: alpha(@text, 0.12);
+}
+.floating-notifications .notification-row .notification-background .notification.critical {
+  background: mix(@base, @red, 0.16);
+  border-color: alpha(@red, 0.75);
+  border-left: 3px solid @red;
+}
+
+/* ──────────────────────────────── виджеты ─────────────────────────────────── */
+
+.widget { margin: 0; padding: 0; }
+
+/* заголовок + «Очистить» */
+.widget-title { margin: 14px 16px 4px; }
+.widget-title > label {
+  font-size: 15px;
+  font-weight: bold;
+  color: @accent;
+  margin-right: 8px;
+}
+.widget-title > button {
+  background: alpha(@surface0, 0.7);
+  color: @subtext0;
+  border: 1px solid alpha(@text, 0.08);
+  border-radius: 10px;
+  padding: 4px 12px;
+  font-size: 12px;
+  margin-left: 8px;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+.widget-title > button:hover {
+  background: linear-gradient(90deg, @accent, @accent2);
+  color: @base;
+  border-color: transparent;
+}
+
+/* «не беспокоить» */
+.widget-dnd { margin: 4px 16px 12px; }
+.widget-dnd > label { font-size: 13px; color: @subtext; }
+.widget-dnd > switch {
+  background: alpha(@crust, 0.55);
+  border: 1px solid alpha(@text, 0.08);
+  border-radius: 999px;
+  min-width: 42px;
+  min-height: 22px;
+  transition: background 0.2s ease;
+}
+.widget-dnd > switch:checked { background: linear-gradient(90deg, @accent, @accent2); }
+.widget-dnd > switch slider {
+  background: @text;
+  border: none;
+  border-radius: 999px;
+  min-width: 18px;
+  min-height: 18px;
+  margin: 2px;
+}
+.widget-dnd > switch:checked slider { background: @base; }
+
+/* разделитель перед списком уведомлений */
+.widget-dnd { border-bottom: 1px solid alpha(@text, 0.07); padding-bottom: 12px; }
+
+/* плеер */
+.widget-mpris { padding: 0; }
+.widget-mpris .widget-mpris-player {
+  background: alpha(@mantle, 0.75);
+  border: 1px solid alpha(@accent, 0.2);
+  border-radius: 14px;
+  margin: 10px 12px 4px;
+  padding: 0;
+  box-shadow: none;
+}
+.widget-mpris .widget-mpris-player .mpris-background { filter: blur(16px); }
+.widget-mpris .widget-mpris-player .mpris-overlay {
+  padding: 12px;
+  background: alpha(@crust, 0.45);
+  border-radius: 14px;
+}
+.widget-mpris .widget-mpris-player .widget-mpris-album-art {
+  -gtk-icon-size: 72px;
+  border-radius: 10px;
+  box-shadow: 0 4px 12px alpha(@crust, 0.6);
+}
+.widget-mpris .widget-mpris-player .widget-mpris-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: @text;
+}
+.widget-mpris .widget-mpris-player .widget-mpris-subtitle {
+  font-size: 12px;
+  color: @subtext;
+}
+.widget-mpris button {
+  background: transparent;
+  border: none;
+  color: @subtext;
+  border-radius: 999px;
+  min-width: 28px;
+  min-height: 28px;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+.widget-mpris button:hover { background: alpha(@surface1, 0.55); color: @text; }
+.widget-mpris button:disabled { color: @overlay1; background: transparent; }
+
+/* ─────────────────── быстрые кнопки, громкость, яркость ───────────────────── */
+
+.widget-buttons-grid {
+  margin: 2px 12px 10px;
+  padding: 0;
+  border-bottom: 1px solid alpha(@text, 0.07);
+  padding-bottom: 12px;
+}
+.widget-buttons-grid > flowbox { background: transparent; }
+.widget-buttons-grid flowboxchild { background: transparent; padding: 0; }
+.widget-buttons-grid flowboxchild > button {
+  background: alpha(@surface0, 0.6);
+  border: 1px solid alpha(@text, 0.07);
+  border-radius: 12px;
+  color: @subtext0;
+  font-size: 16px;
+  min-width: 46px;
+  min-height: 40px;
+  margin: 2px;
+  padding: 0 4px;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+.widget-buttons-grid flowboxchild > button:hover {
+  background: alpha(@surface1, 0.75);
+  color: @text;
+  border-color: alpha(@accent, 0.4);
+}
+/* включённый переключатель (Wi-Fi) — акцентом, как активный стол в Waybar */
+.widget-buttons-grid flowboxchild > button:checked,
+.widget-buttons-grid flowboxchild > button.toggle:checked,
+.widget-buttons-grid flowboxchild > button.active {
+  background: linear-gradient(90deg, @accent, @accent2);
+  color: @base;
+  border-color: transparent;
+}
+
+/* ползунки громкости и яркости */
+.widget-volume, .widget-backlight {
+  background: transparent;
+  margin: 2px 14px;
+  padding: 0;
+  color: @subtext;
+}
+.widget-volume > box > label,
+.widget-backlight > box > label,
+.widget-volume label, .widget-backlight label {
+  font-size: 15px;
+  color: @accent;
+  margin-right: 10px;
+}
+.widget-volume scale, .widget-backlight scale { margin: 6px 0; min-height: 18px; }
+.widget-volume trough, .widget-backlight trough {
+  background: alpha(@crust, 0.6);
+  border: 1px solid alpha(@text, 0.06);
+  border-radius: 999px;
+  min-height: 8px;
+}
+.widget-volume highlight, .widget-backlight highlight {
+  background: linear-gradient(90deg, @accent, @accent2);
+  border-radius: 999px;
+  min-height: 8px;
+}
+.widget-volume slider, .widget-backlight slider {
+  background: @text;
+  border: none;
+  border-radius: 999px;
+  min-width: 14px;
+  min-height: 14px;
+  margin: -4px;
+  box-shadow: 0 1px 4px alpha(@crust, 0.7);
+}
+.widget-volume slider:hover, .widget-backlight slider:hover { background: @accent2; }
+
+/* кнопка «показать громкость по приложениям» и сам список */
+.widget-volume > box > button {
+  background: transparent;
+  border: none;
+  color: @overlay0;
+  border-radius: 999px;
+  min-width: 26px;
+  min-height: 26px;
+}
+.widget-volume > box > button:hover { background: alpha(@surface1, 0.55); color: @text; }
+.per-app-volume {
+  background: alpha(@surface0, 0.45);
+  border-radius: 12px;
+  margin: 6px 0 2px;
+  padding: 6px 8px;
+}
+.widget-volume row { background: transparent; }
+.widget-volume row image { -gtk-icon-size: 20px; margin-right: 8px; }
+
+/* яркость сразу под громкостью — разделитель только после неё */
+.widget-backlight { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid alpha(@text, 0.07); }

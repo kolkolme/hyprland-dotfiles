@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""wallpick — выбор обоев с Waybar и перекраска системы под их цвет.
+
+  wallpick            сетка превью в wofi, выбранные обои применяются
+  wallpick random     случайные обои из папки
+  wallpick apply FILE применить конкретный файл
+  wallpick status     JSON для модуля Waybar
+  wallpick cursor     подобрать тему курсора под текущие обои
+
+Палитра — Catppuccin Mocha, у которой оттенок (hue) фонов, текста и двух
+акцентов (mauve, pink) заменяется оттенком обоев. Смысловые цвета (красный,
+зелёный, жёлтый …) не трогаются. Текущее соответствие «исходный цвет →
+нынешний» лежит в state.json, поэтому конфиги можно спокойно править руками:
+перекрашиваются только цвета из палитры.
+"""
+import colorsys, hashlib, json, math, os, random, re, shutil, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+HOME = Path.home()
+WALLDIR = HOME / "Pictures/wallpapers"
+CACHE = HOME / ".cache/wallpick"
+THUMBS = CACHE / "thumbs"
+STATE = CACHE / "state.json"
+CONF = HOME / ".config"
+HYPRPAPER = CONF / "hypr/hyprpaper.conf"
+PICKER_CSS = CONF / "wallpick/picker.css"
+EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+# файлы, в которых перекрашивается палитра
+MANAGED = [
+    CONF / "waybar/style.css", CONF / "waybar/config.jsonc",
+    CONF / "hypr/hyprland.conf", CONF / "hypr/hyprlock.conf",
+    CONF / "kitty/kitty.conf", CONF / "mako/config",
+    CONF / "wofi/style.css", CONF / "wlogout/style.css",
+    CONF / "starship.toml", PICKER_CSS,
+    CONF / "swaync/style.css",
+]
+
+# Курсоры Catppuccin: 14 акцентов + нейтральный «dark».
+# Тему курсора перекрасить нельзя (внутри 120 бинарных xcursor-файлов),
+# поэтому вместо перекраски выбираем готовый вариант, ближайший по тону.
+CURSOR_ACCENTS = {
+    "rosewater": "f5e0dc", "flamingo": "f2cdcd", "pink": "f5c2e7",
+    "mauve": "cba6f7", "red": "f38ba8", "maroon": "eba0ac",
+    "peach": "fab387", "yellow": "f9e2af", "green": "a6e3a1",
+    "teal": "94e2d5", "sky": "89dceb", "sapphire": "74c7ec",
+    "blue": "89b4fa", "lavender": "b4befe",
+}
+CURSOR_SIZE = 24
+ICONS = HOME / ".local/share/icons"
+
+# Catppuccin Mocha: нейтральные (crust … text) и акценты
+NEUTRALS = ["11111b", "181825", "1e1e2e", "313244", "45475a",
+            "585b70", "6c7086", "a6adc8", "bac2de", "cdd6f4"]
+ACCENT, ACCENT2 = "cba6f7", "f5c2e7"
+CANON = NEUTRALS + [ACCENT, ACCENT2]
+
+
+def rgb(h): return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+def hexc(r, g, b): return "%02x%02x%02x" % (r, g, b)
+def from_hls(h, l, s):
+    return hexc(*(round(c * 255) for c in colorsys.hls_to_rgb(h % 1.0, l, s)))
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {"wallpaper": None, "map": {c: c for c in CANON}}
+
+
+def save_state(st):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(st, indent=1, ensure_ascii=False))
+
+
+def wallpapers():
+    if not WALLDIR.is_dir():
+        return []
+    return sorted(p for p in WALLDIR.rglob("*")
+                  if p.suffix.lower() in EXTS and "thumbs" not in p.parts)
+
+
+# ---------- цвет обоев ----------
+
+def wall_color(path):
+    """Оттенок и «цветность» обоев.
+
+    Средний цвет считается как круговое среднее hue с весом s·v: так яркие
+    цветные участки задают тон, а серые и тёмные почти не влияют (простое
+    арифметическое среднее почти всегда даёт грязно-серый)."""
+    from PIL import Image
+    im = Image.open(path).convert("RGB").resize((96, 96))
+    x = y = 0.0
+    sats = []
+    px = list(im.get_flattened_data() if hasattr(im, "get_flattened_data") else im.getdata())
+    for r, g, b in px:
+        h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        w = s * v
+        x += w * math.cos(2 * math.pi * h)
+        y += w * math.sin(2 * math.pi * h)
+        if v > 0.12:                             # чёрное не в счёт
+            sats.append(s)
+    hue = (math.atan2(y, x) / (2 * math.pi)) % 1.0
+    # цветность видимых участков: ~0.05 у ч/б фото, 0.5+ у ярко окрашенных
+    chroma = sum(sats) / len(sats) if sats else 0.0
+    return hue, chroma
+
+
+# Насколько сильно окрашивать систему — крутить здесь.
+TINT_BG = 0.45      # фоны: доля исходной насыщенности Catppuccin при цветных обоях
+TINT_TEXT = 0.25    # тексты: почти нейтральные
+ACCENT_SAT = 0.55   # насыщенность акцента при цветных обоях (0…1)
+
+
+def make_palette(hue, chroma):
+    c = min(1.0, chroma * 2.2)                   # 0 — ч/б обои, 1 — очень цветные
+    pal = {}
+    for n in NEUTRALS:
+        _, l, s = colorsys.rgb_to_hls(*(v / 255 for v in rgb(n)))
+        k = (TINT_TEXT if l > 0.55 else TINT_BG) * max(0.3, c)
+        pal[n] = from_hls(hue, l, s * k)
+    sa = max(0.15, ACCENT_SAT * c)
+    pal[ACCENT] = from_hls(hue, 0.74, sa)
+    pal[ACCENT2] = from_hls(hue + 0.03, 0.82, sa * 0.8)
+    return pal
+
+
+# ---------- перекраска конфигов ----------
+
+# 6 hex-цифр после «#» или «(», дальше может идти альфа из 2 цифр: #cba6f7, #181825e6, rgba(cba6f7ee)
+HEX_RE = re.compile(r"(?<=[#(])[0-9a-fA-F]{6}(?=(?:[0-9a-fA-F]{2})?(?![0-9a-fA-F]))")
+DEC_RE = re.compile(r"(rgba?\(\s*)(\d{1,3})(\s*,\s*)(\d{1,3})(\s*,\s*)(\d{1,3})")
+
+
+def foreign_colors(files, current):
+    """Цвета в конфигах, которые не из палитры (красный, зелёный …)."""
+    cur = set(current.values())
+    out = set()
+    for f in files:
+        try:
+            t = f.read_text()
+        except OSError:
+            continue
+        for m in HEX_RE.finditer(t):
+            h = m.group(0).lower()
+            if h not in cur:
+                out.add(h)
+    return out
+
+
+def dedupe(new, avoid):
+    """Новые цвета не должны совпадать между собой и с чужими цветами,
+    иначе при следующей смене не понять, что перекрашивать."""
+    used = set(avoid)
+    for c in CANON:
+        h = new[c]
+        while h in used:
+            r, g, b = rgb(h)
+            h = hexc(r, g, b + 1 if b < 255 else b - 1)
+        new[c] = h
+        used.add(h)
+    return new
+
+
+def recolor(current, new):
+    old2new = {current[c]: new[c] for c in CANON}
+    dec = {rgb(k): rgb(v) for k, v in old2new.items()}
+
+    def sub_hex(m):
+        h = m.group(0)
+        n = old2new.get(h.lower())
+        return (n.upper() if h.isupper() else n) if n else h
+
+    def sub_dec(m):
+        t = tuple(int(m.group(i)) for i in (2, 4, 6))
+        if t not in dec:
+            return m.group(0)
+        r, g, b = dec[t]
+        return f"{m.group(1)}{r}{m.group(3)}{g}{m.group(5)}{b}"
+
+    for f in MANAGED:
+        if not f.exists():
+            continue
+        t = f.read_text()
+        n = DEC_RE.sub(sub_dec, HEX_RE.sub(sub_hex, t))
+        if n != t:
+            bak = f.with_name(f.name + ".before-wallpick")
+            if not bak.exists():
+                shutil.copy2(f, bak)
+            f.write_text(n)
+
+
+def pick_cursor(hue, chroma):
+    """Имя темы курсора под тон обоев. Серые обои — нейтральный курсор."""
+    if chroma * 2.2 < 0.22:                      # ч/б или почти ч/б картинка
+        return "catppuccin-mocha-dark-cursors"
+    best, dist = None, 9
+    for name, hexv in CURSOR_ACCENTS.items():
+        h, _, s = colorsys.rgb_to_hls(*(v / 255 for v in rgb(hexv)))
+        if s < 0.15:
+            continue
+        d = abs(h - hue) % 1.0
+        d = min(d, 1 - d)                        # тон — круг, 0.99 и 0.01 рядом
+        if d < dist:
+            best, dist = name, d
+    return f"catppuccin-mocha-{best}-cursors"
+
+
+def set_cursor(name):
+    """Прописать тему курсора в GTK, Hyprland и применить на лету."""
+    if not (ICONS / name).is_dir():
+        return
+    for f, pat in ((CONF / "gtk-3.0/settings.ini", r"(?m)^(gtk-cursor-theme-name\s*=\s*).*$"),
+                   (CONF / "gtk-4.0/settings.ini", r"(?m)^(gtk-cursor-theme-name\s*=\s*).*$")):
+        if f.exists():
+            s = f.read_text()
+            n = re.sub(pat, lambda m: m.group(1) + name, s)
+            if n != s:
+                f.write_text(n)
+    hc = CONF / "hypr/hyprland.conf"
+    if hc.exists():
+        s = hc.read_text()
+        n = re.sub(r"(?m)^(\s*env\s*=\s*(?:XCURSOR_THEME|HYPRCURSOR_THEME)\s*,).*$",
+                   lambda m: m.group(1) + name, s)
+        if n != s:
+            hc.write_text(n)
+    run("hyprctl", "setcursor", name, str(CURSOR_SIZE))
+    run("gsettings", "set", "org.gnome.desktop.interface", "cursor-theme", name)
+
+
+def run(*cmd):
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def reload_apps():
+    run("pkill", "-SIGUSR2", "-x", "waybar")     # стиль и конфиг Waybar
+    run("makoctl", "reload")
+    run("swaync-client", "--reload-css")     # центр уведомлений
+    run("pkill", "-SIGUSR1", "-x", "kitty")      # kitty перечитывает конфиг
+    # hyprland.conf Hyprland перечитывает сам при изменении файла
+
+
+# ---------- обои ----------
+
+def set_wallpaper(path):
+    try:
+        mons = json.loads(subprocess.check_output(["hyprctl", "monitors", "-j"]))
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        mons = []
+    for m in mons:
+        run("hyprctl", "hyprpaper", "wallpaper", f"{m['name']},{path},cover")
+    if HYPRPAPER.exists():                       # чтобы пережили перезагрузку
+        t = HYPRPAPER.read_text()
+        HYPRPAPER.write_text(re.sub(r"(?m)^(\s*path\s*=\s*).*$",
+                                    lambda m: m.group(1) + str(path), t, count=1))
+
+
+def thumb(p):
+    st = p.stat()
+    key = f"{p}|{st.st_mtime_ns}|{st.st_size}".encode()
+    t = THUMBS / (hashlib.sha1(key).hexdigest()[:16] + ".png")
+    if not t.exists():
+        subprocess.run(["magick", f"{p}[0]", "-thumbnail", "320x200^",
+                        "-gravity", "center", "-extent", "320x200", str(t)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return t
+
+
+def apply(path):
+    path = Path(path).expanduser().resolve()
+    st = load_state()
+    set_wallpaper(path)
+    hue, chroma = wall_color(path)
+    new = dedupe(make_palette(hue, chroma),
+                 foreign_colors(MANAGED, st["map"]))
+    recolor(st["map"], new)
+    st["wallpaper"] = str(path)
+    st["map"] = new
+    save_state(st)
+    set_cursor(pick_cursor(hue, chroma))         # курсор тоже под тон обоев
+    reload_apps()
+    run("pkill", "-RTMIN+8", "-x", "waybar")
+    run("notify-send", "-a", "wallpick", "-i", str(thumb(path)),
+        "Обои сменены", f"{path.name}\nакцент #{new[ACCENT]}")
+
+
+def pick():
+    walls = wallpapers()
+    if not walls:
+        run("notify-send", "wallpick", f"Нет картинок в {WALLDIR}")
+        return
+    THUMBS.mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+        thumbs = list(ex.map(thumb, walls))
+    by_thumb = {str(t): w for t, w in zip(thumbs, walls)}
+    lines = "\n".join(f"img:{t}" for t in thumbs)
+    r = subprocess.run(
+        ["wofi", "--dmenu", "--allow-images", "--style", str(PICKER_CSS),
+         "--columns", "3", "--width", "1040", "--height", "640",
+         "--prompt", "Обои", "-D", "image_size=300", "-D", "orientation=vertical",
+         "-D", "halign=fill", "-D", "content_halign=center", "-D", "hide_scroll=true",
+         "-D", "dynamic_lines=false", "-i", "--cache-file", "/dev/null"],
+        input=lines, capture_output=True, text=True)
+    sel = r.stdout.strip()
+    if not sel:
+        return
+    sel = sel.removeprefix("img:").split(":text:", 1)[0]
+    if sel in by_thumb:
+        apply(by_thumb[sel])
+
+
+def status():
+    st = load_state()
+    w = Path(st["wallpaper"]).name if st.get("wallpaper") else "—"
+    print(json.dumps({
+        "text": "\uf03e",
+        "tooltip": f"Обои: {w}\nЛКМ — выбрать · ПКМ — случайные · СКМ — открыть папку",
+    }, ensure_ascii=False))
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        pick()
+    elif a[0] == "random":
+        cur = load_state().get("wallpaper")
+        pool = [w for w in wallpapers() if str(w) != cur] or wallpapers()
+        if pool:
+            apply(random.choice(pool))
+    elif a[0] == "apply" and len(a) > 1:
+        apply(a[1])
+    elif a[0] == "cursor":
+        cur = load_state().get("wallpaper")
+        if not cur:
+            print("обои ещё не выбирались")
+            return
+        hue, chroma = wall_color(cur)
+        name = pick_cursor(hue, chroma)
+        set_cursor(name)
+        print(f"курсор: {name}")
+    elif a[0] == "status":
+        status()
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

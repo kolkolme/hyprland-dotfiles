@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# VPN через NetworkManager: кнопка в Waybar и команда в терминале.
+# Подробности: man vpn   ·   краткая справка: vpn --help
+
+VERSION="1.1"
+
+usage() {
+    cat <<'HELP'
+vpn — включение и выключение VPN через NetworkManager.
+
+ИСПОЛЬЗОВАНИЕ
+    vpn [команда]
+
+КОМАНДЫ
+    up              включить VPN (первое настроенное подключение)
+    down            выключить активный VPN
+    toggle          переключить: включён — выключить, выключен — включить
+    status          строка JSON о состоянии (её читает модуль Waybar)
+    menu            открыть настройки сетевых подключений
+    agent           поднять агент секретов и оставить его работать
+    -h, --help      показать эту справку
+    -V, --version   показать версию
+
+    Без аргументов равнозначно «vpn status».
+
+КОДЫ ВОЗВРАТА
+    0   успех (в том числе «выключать нечего»)
+    1   VPN не настроен, не удалось подключиться или неизвестная команда
+
+ПРИМЕРЫ
+    vpn up                  подключиться
+    vpn down                отключиться
+    vpn toggle              переключить одним нажатием
+    vpn status | jq -r .tooltip    посмотреть, что показывает панель
+
+Полное описание: man vpn
+HELP
+}
+
+# имя первого VPN-соединения (или активного, если оно есть)
+vpn_name() {
+    nmcli -t -f TYPE,NAME connection show --active | awk -F: '$1=="vpn"||$1=="wireguard"{print $2; exit}'
+    :
+}
+any_vpn() {
+    nmcli -t -f TYPE,NAME connection show | awk -F: '$1=="vpn"||$1=="wireguard"{print $2; exit}'
+}
+active() { [[ -n $(vpn_name) ]]; }
+
+# IP-адрес и имя интерфейса активного VPN — для подсказки
+vpn_info() {
+    local n; n=$(vpn_name); [[ -z $n ]] && return
+    nmcli -t -f IP4.ADDRESS,GENERAL.DEVICES connection show "$n" 2>/dev/null |
+        awk -F: '/IP4.ADDRESS/{split($2,a,"/"); ip=a[1]} /GENERAL.DEVICES/{dev=$2}
+                 END{if(ip) printf "%s", ip; if(dev) printf " · %s", dev}'
+}
+
+status() {
+    local n icon cls tip
+    if n=$(vpn_name); [[ -n $n ]]; then
+        icon=$''                      # замок закрыт
+        cls=connected
+        tip="VPN включён: $n"
+        local i; i=$(vpn_info); [[ -n $i ]] && tip="$tip\\n$i"
+    else
+        n=$(any_vpn)
+        icon=$''                      # замок открыт
+        cls=disconnected
+        tip="VPN выключен${n:+ ($n)}"
+    fi
+    printf '{"text":"%s","class":"%s","tooltip":"%s\\nЛКМ — включить/выключить · ПКМ — настройки"}\n' \
+        "$icon" "$cls" "$tip"
+}
+
+refresh() { pkill -RTMIN+8 -x waybar; }
+
+# Агент секретов. openconnect (AnyConnect) каждый раз просит пароль через
+# отдельное окно, а показать его может только агент — nm-applet. Постоянно
+# держать его незачем: он вешает в трей второй значок сети. Поэтому поднимаем
+# на время подключения и гасим, если подняли сами.
+AGENT_STARTED=0
+ensure_agent() {
+    pgrep -x nm-applet >/dev/null && return 0
+    setsid nm-applet >/dev/null 2>&1 < /dev/null &
+    AGENT_STARTED=1
+    sleep 2        # регистрация агента у NetworkManager занимает меньше секунды,
+                   # но спросить секреты раньше неё — значит получить отказ
+}
+stop_agent() {
+    [[ $AGENT_STARTED == 1 ]] && pkill -x nm-applet
+    AGENT_STARTED=0
+}
+
+up() {
+    local n; n=$(any_vpn)
+    [[ -z $n ]] && { notify-send -a VPN "VPN не настроен" "Добавь подключение в настройках сети"; return 1; }
+    notify-send -a VPN -t 2500 "VPN" "Подключаюсь: $n…"
+    ensure_agent
+    if nmcli connection up "$n" >/dev/null 2>&1; then
+        notify-send -a VPN "VPN включён" "$n"
+    else
+        notify-send -a VPN -u critical "Не удалось включить VPN" "$n\nПроверь пароль в окне входа"
+    fi
+    stop_agent
+    refresh
+}
+
+down() {
+    local n; n=$(vpn_name)
+    if [[ -z $n ]]; then
+        echo "VPN уже выключен" >&2
+        return 0
+    fi
+    if nmcli connection down "$n" >/dev/null 2>&1; then
+        notify-send -a VPN "VPN выключен" "$n"
+    else
+        notify-send -a VPN -u critical "Не удалось выключить VPN" "$n"
+        refresh
+        return 1
+    fi
+    refresh
+}
+
+case ${1:-status} in
+    status) status ;;
+    toggle) active && down || up ;;
+    up)     up ;;
+    down)   down ;;
+    menu)   nm-connection-editor & ;;
+    agent)  ensure_agent; AGENT_STARTED=0; echo "агент секретов запущен (nm-applet)" ;;
+    -h|--help|help) usage ;;
+    -V|--version)   echo "vpn $VERSION" ;;
+    *) echo "vpn: неизвестная команда — «$1»" >&2
+       echo "Попробуй «vpn --help» или «man vpn»." >&2
+       exit 1 ;;
+esac

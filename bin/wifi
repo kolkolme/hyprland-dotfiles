@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+"""wifi — менеджер Wi-Fi в терминале.
+
+  wifi              открыть панель
+  wifi --toggle     открыть, а если уже открыта — закрыть (клик по значку)
+  wifi status       коротко в stdout: сеть, сигнал, адрес
+
+Умеет всё, зачем обычно лезут в nm-connection-editor: подключиться (с вводом
+пароля), отключиться, забыть сеть, сменить пароль, автоподключение, скрытая
+сеть, включить/выключить сам модуль. Работает через nmcli, поэтому профили
+общие с системой. Цвета — из палитры терминала, так что wallpick перекрашивает
+панель вместе со всем остальным.
+"""
+import curses, locale, os, subprocess, sys, time
+
+locale.setlocale(locale.LC_ALL, "")
+
+DEV = os.environ.get("WIFI_DEV", "wlan0")
+CLASS = "wifi-widget"
+SIBLINGS = ("bt-widget",)          # соседняя панель: открываем по одной
+
+# ─── клавиши в любой раскладке ──────────────────────────────────────────────
+RU2EN = str.maketrans(
+    "йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,",
+    "qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?")
+
+
+def key(ch):
+    """Нажатие → латинский эквивалент; латиницу и знаки не трогаем."""
+    if isinstance(ch, str) and ch and ("а" <= ch.lower() <= "я" or ch.lower() == "ё"):
+        return ch.translate(RU2EN)
+    return ch
+
+
+# ─── nmcli ──────────────────────────────────────────────────────────────────
+def nm(*args, timeout=10):
+    """nmcli без интерактива: вместо вопроса о пароле — честная ошибка."""
+    try:
+        r = subprocess.run(["nmcli", *args], capture_output=True, text=True,
+                           timeout=timeout, stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "не дождались ответа NetworkManager"
+    except FileNotFoundError:
+        return 127, "", "nmcli не установлен"
+
+
+def split_nm(line):
+    """Разбор строки `nmcli -t`: двоеточия внутри значений приходят как «\\:»."""
+    out, cur, esc = [], [], False
+    for c in line:
+        if esc:
+            cur.append(c)
+            esc = False
+        elif c == "\\":
+            esc = True
+        elif c == ":":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    out.append("".join(cur))
+    return out
+
+
+def radio_on():
+    return nm("-t", "-f", "WIFI", "radio")[1].strip() == "enabled"
+
+
+def band_of(freq):
+    try:
+        f = int(freq.split()[0])
+    except (ValueError, IndexError):
+        return ""
+    return "6" if f >= 5925 else "5" if f >= 4900 else "2.4"
+
+
+def saved_map():
+    """{ssid: имя профиля} по сохранённым Wi-Fi-соединениям."""
+    out = {}
+    code, data, _ = nm("-t", "-f", "NAME,TYPE", "connection", "show")
+    if code:
+        return out
+    names = [split_nm(l)[0] for l in data.splitlines()
+             if split_nm(l)[1:2] == ["802-11-wireless"]]
+    for name in names:
+        ssid = nm("-g", "802-11-wireless.ssid", "connection", "show", name)[1]
+        out.setdefault(ssid or name, name)
+    return out
+
+
+def scan(rescan=False):
+    """Список сетей: сильнейшая точка на каждое имя, с пометкой диапазонов."""
+    if rescan:
+        nm("device", "wifi", "rescan", timeout=15)
+    code, data, _ = nm("-t", "-f", "IN-USE,SIGNAL,SECURITY,FREQ,SSID,BSSID",
+                       "device", "wifi", "list", timeout=15)
+    if code:
+        return []
+    seen = {}
+    for line in data.splitlines():
+        f = split_nm(line)
+        if len(f) < 6:
+            continue
+        in_use, signal, sec, freq, ssid, bssid = f[0], f[1], f[2], f[3], f[4], ":".join(f[5:])
+        try:
+            signal = int(signal)
+        except ValueError:
+            signal = 0
+        band = band_of(freq)
+        net = {"ssid": ssid, "signal": signal, "sec": sec.strip(),
+               "bssid": bssid, "band": band, "in_use": in_use.strip() == "*",
+               "bands": {band} if band else set()}
+        k = ssid or bssid                      # у скрытых сетей имени нет
+        old = seen.get(k)
+        if old is None:
+            seen[k] = net
+        else:
+            old["bands"] |= net["bands"]
+            old["in_use"] = old["in_use"] or net["in_use"]
+            if net["signal"] > old["signal"]:
+                net["bands"] = old["bands"]
+                net["in_use"] = old["in_use"]
+                seen[k] = net
+    nets = list(seen.values())
+    nets.sort(key=lambda n: (not n["in_use"], not n["ssid"], -n["signal"],
+                             n["ssid"].lower()))
+    return nets
+
+
+def link_info():
+    """Сведения о текущем подключении: адрес, шлюз, DNS, скорость канала."""
+    code, data, _ = nm("-t", "-f", "GENERAL.CONNECTION,GENERAL.HWADDR,"
+                       "IP4.ADDRESS,IP4.GATEWAY,IP4.DNS,IP6.ADDRESS",
+                       "device", "show", DEV)
+    info = {}
+    if code:
+        return info
+    for line in data.splitlines():
+        f = split_nm(line)
+        if len(f) < 2:
+            continue
+        info.setdefault(f[0], []).append(":".join(f[1:]))
+    return info
+
+
+# ─── действия ───────────────────────────────────────────────────────────────
+def agent_up(sec):
+    """Сети с 802.1X спрашивают вход отдельным окном, показать его может только
+    агент секретов (nm-applet). Поднимаем на время попытки, если его нет."""
+    if "802.1X" not in (sec or "").upper():
+        return None
+    if subprocess.run(["pgrep", "-x", "nm-applet"],
+                      capture_output=True).returncode == 0:
+        return None
+    try:
+        p = subprocess.Popen(["nm-applet"], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        time.sleep(2)            # дать агенту зарегистрироваться у NetworkManager
+        return p
+    except FileNotFoundError:
+        return None
+
+
+def connect(net, saved, password=None, hidden=False):
+    name = saved.get(net["ssid"])
+    agent = agent_up(net.get("sec"))
+    if password is None and name:                    # профиль уже есть
+        code, _, err = nm("-w", "25", "connection", "up", "id", name, timeout=30)
+    else:
+        target = net["ssid"] or net["bssid"]
+        args = ["-w", "25", "device", "wifi", "connect", target]
+        if password:
+            args += ["password", password]
+        if hidden or not net["ssid"]:
+            args += ["hidden", "yes"]
+        args += ["ifname", DEV]
+        code, _, err = nm(*args, timeout=35)
+    if agent is not None:
+        agent.terminate()
+    if code == 0:
+        return f"подключено: {label_of(net)}"
+    return "не вышло: " + short_err(err)
+
+
+def short_err(err):
+    err = (err or "").replace("Error:", "").strip()
+    low = err.lower()
+    if "secrets were required" in low or "no secrets" in low or "802-1x" in low:
+        return "нужен пароль (или он не подошёл)"
+    if "not authorized" in low:
+        return "нет прав — нужен пароль администратора"
+    if "timeout" in low or "не дождались" in low:
+        return "сеть не ответила"
+    return (err.splitlines() or ["ошибка"])[0][:60]
+
+
+def label_of(net):
+    return net["ssid"] or f"скрытая · {net['bssid'][:8]}…"
+
+
+# ─── отрисовка ──────────────────────────────────────────────────────────────
+C_FRAME, C_TEXT, C_MUTED, C_GOOD, C_WARN, C_BAD, C_SEL, C_HINT = range(1, 9)
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()            # прозрачный фон — виден блюр kitty
+    curses.init_pair(C_FRAME, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_TEXT,  -1, -1)
+    curses.init_pair(C_MUTED, 8, -1)
+    curses.init_pair(C_GOOD,  curses.COLOR_GREEN, -1)
+    curses.init_pair(C_WARN,  curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_BAD,   curses.COLOR_RED, -1)
+    curses.init_pair(C_SEL,   curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_HINT,  8, -1)
+
+
+def put(win, y, x, text, attr=0, width=None):
+    """Пишем, не падая на правой грани и не вылезая за неё."""
+    h, w = win.getmaxyx()
+    if not (0 <= y < h) or x >= w - 1:
+        return
+    room = (w - 1 - x) if width is None else min(width, w - 1 - x)
+    try:
+        win.addstr(y, x, text[:room], attr)
+    except curses.error:
+        pass
+
+
+BARS = "▁▃▅▇"
+
+
+def bars(signal):
+    """Четыре полоски: заполненные по силе сигнала, остальные приглушены."""
+    lit = 0 if signal <= 0 else 1 if signal < 40 else 2 if signal < 60 else 3 if signal < 78 else 4
+    return "".join(BARS[i] if i < lit else "·" for i in range(4)), lit
+
+
+def prompt(win, label, initial="", mask=False):
+    """Строка ввода внизу панели. Enter — принять, Esc — отменить, Tab — показать пароль."""
+    h, w = win.getmaxyx()
+    y = h - 2
+    buf, hide = list(initial), mask
+    curses.curs_set(1)
+    while True:
+        shown = ("•" * len(buf)) if hide else "".join(buf)
+        win.move(y, 1)
+        win.clrtoeol()
+        put(win, y, 2, (label + shown)[-(w - 5):], curses.color_pair(C_TEXT))
+        put(win, y, w - 1, "│", curses.color_pair(C_FRAME))
+        win.refresh()
+        try:
+            ch = win.get_wch()
+        except curses.error:
+            continue
+        if ch in ("\n", "\r", curses.KEY_ENTER, 10, 13):
+            curses.curs_set(0)
+            return "".join(buf)
+        if ch == "\x1b":
+            curses.curs_set(0)
+            return None
+        if ch == "\t":
+            hide = not hide
+        elif ch in ("\x7f", "\b", curses.KEY_BACKSPACE, 263):
+            if buf:
+                buf.pop()
+        elif isinstance(ch, str) and ch.isprintable():
+            buf.append(ch)
+
+
+HELP = [
+    ("↓ ↑  j k", "двигаться по списку"),
+    ("Enter", "подключиться к выбранной сети"),
+    ("d", "отключиться от текущей"),
+    ("p", "сменить пароль сохранённой сети"),
+    ("f   Del", "забыть сеть (удалить профиль)"),
+    ("a", "автоподключение: вкл / выкл"),
+    ("n", "скрытая сеть — ввести имя вручную"),
+    ("w", "Wi-Fi целиком: включить / выключить"),
+    ("r", "искать сети заново"),
+    ("i", "адрес, шлюз, DNS"),
+    ("?", "эта справка   ·   q выход"),
+    ("", ""),
+    ("ЛКМ", "выбрать сеть"),
+    ("2×ЛКМ", "подключиться, а к текущей — отключиться"),
+    ("ПКМ", "меню со всеми действиями"),
+    ("колесо", "листать список"),
+    ("×", "закрыть панель (угол справа вверху)"),
+    ("", ""),
+    ("раскладка", "любая: в=d, у=e, ф=a, к=r, ц=w"),
+]
+
+
+def overlay(win, title, rows, pairs=True):
+    """Всплывающая табличка поверх списка — справка и сведения."""
+    h, w = win.getmaxyx()
+    bw = min(58, max(28, w - 2))
+    vis = rows[: max(1, h - 5)]
+    bh = min(len(vis) + 4, h)
+    box = win.derwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
+    box.erase()
+    box.attrset(curses.color_pair(C_FRAME))
+    box.box()
+    put(box, 0, 2, f" {title} ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+    for i, row in enumerate(vis, start=2):
+        if i >= bh - 1:
+            break
+        k, v = row if pairs else ("", row)
+        put(box, i, 3, f"{k:<11}", curses.color_pair(C_WARN), 12)
+        put(box, i, 15 if pairs else 3, v, curses.color_pair(C_MUTED), bw - 17)
+    if len(vis) < len(rows):
+        put(box, bh - 1, 2, " окно мало — растяни ", curses.color_pair(C_MUTED))
+    box.refresh()
+    win.get_wch()
+
+
+def menu(win, my, mx, items, title=""):
+    """Всплывающее меню: выбрать можно и мышью, и клавишами. → действие или None.
+
+    Пункт («подпись», «действие»); действие None — это разделитель."""
+    h, w = win.getmaxyx()
+    bw = min(max(len(t) for t, _ in items) + 6, max(20, w - 2))
+    bh = min(len(items) + 2, h)
+    y = max(0, min(my, h - bh))
+    x = max(0, min(mx, w - bw))
+    box = win.derwin(bh, bw, y, x)
+    sel = next((i for i, (_, a) in enumerate(items) if a), 0)
+
+    while True:
+        box.erase()
+        box.attrset(curses.color_pair(C_FRAME))
+        box.box()
+        if title:
+            put(box, 0, 2, f" {title} ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+        for i, (text, act) in enumerate(items):
+            row = 1 + i
+            if row >= bh - 1:
+                break
+            if act is None:
+                put(box, row, 1, "─" * (bw - 2), curses.color_pair(C_MUTED))
+                continue
+            attr = curses.color_pair(C_TEXT)
+            if i == sel:
+                attr = curses.color_pair(C_SEL) | curses.A_BOLD
+            put(box, row, 2, ("▸ " if i == sel else "  ") + text, attr, bw - 4)
+        box.refresh()
+
+        try:
+            ch = key(win.get_wch())
+        except curses.error:
+            continue
+        if ch == curses.KEY_MOUSE:
+            try:
+                _, cx, cy, _, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            inside = y <= cy < y + bh and x <= cx < x + bw
+            if not inside:
+                return None                      # клик мимо — просто закрыть
+            i = cy - y - 1
+            if 0 <= i < len(items) and items[i][1]:
+                if bstate & (curses.BUTTON1_RELEASED | curses.BUTTON1_PRESSED
+                             | curses.BUTTON3_PRESSED | curses.BUTTON3_RELEASED):
+                    return items[i][1]
+                sel = i
+            continue
+        if ch in ("q", "Q", "\x1b"):
+            return None
+        if ch in ("j", curses.KEY_DOWN):
+            nxt = [i for i, (_, a) in enumerate(items) if a and i > sel]
+            sel = nxt[0] if nxt else sel
+        elif ch in ("k", curses.KEY_UP):
+            prv = [i for i, (_, a) in enumerate(items) if a and i < sel]
+            sel = prv[-1] if prv else sel
+        elif ch in ("\n", "\r", curses.KEY_ENTER):
+            return items[sel][1]
+
+
+def ask_yes(stdscr, question):
+    """Да/нет — мышью тоже: маленькое меню по центру."""
+    h, w = stdscr.getmaxyx()
+    return menu(stdscr, h // 2 - 2, max(2, w // 2 - 14),
+                [("Да", "yes"), ("Отмена", "no")], question) == "yes"
+
+
+def draw(stdscr, st):
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    stdscr.attrset(curses.color_pair(C_FRAME))
+    stdscr.box()
+    put(stdscr, 0, 2, " WI-FI ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+    put(stdscr, 0, w - 5, " × ", curses.color_pair(C_MUTED))
+    st["zones"] = {"quit": (0, w - 5, w - 3)}          # кнопка: строка, слева, справа
+
+    if not st["radio"]:
+        head, hattr = " выключен ", C_BAD
+    else:
+        cur = next((n for n in st["nets"] if n["in_use"]), None)
+        head = f" {label_of(cur)} · {cur['signal']}% " if cur else " не подключено "
+        hattr = C_GOOD if cur else C_MUTED
+    hx = max(9, w - len(head) - 6)
+    put(stdscr, 0, hx, head, curses.color_pair(hattr))
+    st["zones"]["radio"] = (0, hx, hx + len(head))     # клик по состоянию — вкл/выкл
+
+    body_h = h - 4
+    nets = st["nets"]
+    st["sel"] = max(0, min(st["sel"], len(nets) - 1))
+    top = max(0, st["sel"] - body_h + 2) if st["sel"] >= body_h else 0
+    st["rowmap"] = {}
+
+    if not st["radio"]:
+        msg = "Wi-Fi выключен — нажми «w» или щёлкни по надписи справа вверху"
+        put(stdscr, h // 2, max(2, (w - len(msg)) // 2), msg, curses.color_pair(C_MUTED))
+    elif not nets:
+        msg = "сетей не видно — «r» поискать заново"
+        put(stdscr, h // 2, max(2, (w - len(msg)) // 2), msg, curses.color_pair(C_MUTED))
+
+    for i, net in enumerate(nets[top: top + body_h]):
+        y, idx = 2 + i, top + i
+        st["rowmap"][y] = idx
+        is_sel = idx == st["sel"]
+        bar, lit = bars(net["signal"])
+        put(stdscr, y, 2, "▸ " if is_sel else "  ",
+            curses.color_pair(C_SEL) | curses.A_BOLD)
+        put(stdscr, y, 4, "●" if net["in_use"] else "○",
+            curses.color_pair(C_GOOD if net["in_use"] else C_MUTED))
+        put(stdscr, y, 6, bar, curses.color_pair(
+            C_BAD if lit <= 1 else C_WARN if lit == 2 else C_GOOD))
+
+        right = ("★ " if net["ssid"] in st["saved"] else "  ")
+        if net["sec"] in ("", "--"):
+            right += "открытая "
+        right += "/".join(sorted(net["bands"], reverse=True))
+        x, avail = 11, w - 11 - len(right) - 3
+        name = label_of(net)
+        if len(name) > avail > 1:
+            name = name[: avail - 1] + "…"
+        attr = curses.color_pair(C_TEXT)
+        if net["in_use"]:
+            attr = curses.color_pair(C_GOOD) | curses.A_BOLD
+        elif is_sel:
+            attr |= curses.A_BOLD
+        put(stdscr, y, x, name, attr)
+        put(stdscr, y, max(x + 1, w - len(right) - 3), right,
+            curses.color_pair(C_WARN if net["ssid"] in st["saved"] else C_MUTED))
+
+    if st.get("hidden"):                              # скрытые — одной строкой
+        y = 2 + min(len(nets) - top, body_h)
+        put(stdscr, y, 6, f"+ {st['hidden']} скрытых сетей · «n» подключиться по имени",
+            curses.color_pair(C_MUTED), w - 8)
+
+    bar_txt = "ЛКМ выбрать · 2×ЛКМ подключить · ПКМ меню · ? клавиши"
+    hint = st["msg"] or bar_txt
+    put(stdscr, h - 2, 2, hint, curses.color_pair(C_WARN if st["msg"] else C_HINT), w - 4)
+    st["zones"]["menu"] = (h - 2, 2, w - 3)            # клик по подсказке — меню
+    stdscr.refresh()
+
+
+def info_rows():
+    info = link_info()
+    one = lambda k: (info.get(k) or [""])[0]
+    rows = [("сеть", one("GENERAL.CONNECTION") or "—"),
+            ("адрес", one("IP4.ADDRESS[1]") or "—"),
+            ("шлюз", one("IP4.GATEWAY") or "—")]
+    dns = [vals[0] for k, vals in sorted(info.items()) if k.startswith("IP4.DNS")]
+    rows.append(("DNS", ", ".join(dns) or "—"))
+    rows.append(("IPv6", one("IP6.ADDRESS[1]") or "—"))
+    rows.append(("MAC", one("GENERAL.HWADDR") or "—"))
+    rows.append(("устройство", DEV))
+    return rows
+
+
+def refresh(st, rescan=False):
+    st["radio"] = radio_on()
+    found = scan(rescan) if st["radio"] else []
+    # сети без имени в списке бесполезны: к ним подключаются через «n», по имени.
+    # Поэтому держим их за списком и показываем одной строкой-счётчиком.
+    st["nets"] = [n for n in found if n["ssid"]]
+    st["hidden"] = sum(1 for n in found if not n["ssid"])
+    st["saved"] = saved_map()
+    st["stamp"] = time.time()
+
+
+def row_menu(st):
+    """Меню для выбранной сети — тем же набором, что и клавиши."""
+    cur = st["nets"][st["sel"]] if st["nets"] else None
+    saved = cur and cur["ssid"] in st["saved"]
+    items = []
+    if cur:
+        if cur["in_use"]:
+            items.append(("Отключиться", "disconnect"))
+        else:
+            items.append((f"Подключиться к «{label_of(cur)}»"[:44], "connect"))
+        if saved:
+            items.append(("Сменить пароль", "password"))
+            items.append(("Автоподключение вкл/выкл", "auto"))
+            items.append(("Забыть сеть", "forget"))
+        items.append(("-", None))
+    items += [("Сведения о подключении", "info"),
+              ("Искать сети заново", "rescan"),
+              ("Скрытая сеть…", "hidden"),
+              ("Wi-Fi " + ("выключить" if st["radio"] else "включить"), "radio"),
+              ("-", None),
+              ("Клавиши", "help"),
+              ("Закрыть панель", "quit")]
+    return items
+
+
+def act(stdscr, st, action):
+    """Одно действие — неважно, откуда пришло: с клавиши, из меню или мышью."""
+    cur = st["nets"][st["sel"]] if st["nets"] else None
+
+    if action == "quit":
+        return True
+
+    if action == "connect" and cur:
+        if cur["in_use"]:
+            st["msg"] = "это текущая сеть · «d» отключиться, «i» сведения"
+            return False
+        need_pass = cur["sec"] not in ("", "--") and cur["ssid"] not in st["saved"]
+        pw = None
+        if need_pass:
+            pw = prompt(stdscr, f"пароль для «{label_of(cur)}»: ", mask=True)
+            if pw is None:
+                st["msg"] = "отменено"
+                return False
+        st["msg"] = f"подключаюсь к «{label_of(cur)}»…"
+        draw(stdscr, st)
+        st["msg"] = connect(cur, st["saved"], pw)
+        refresh(st)
+
+    elif action == "disconnect":
+        active = next((n for n in st["nets"] if n["in_use"]), None)
+        if not active:
+            st["msg"] = "и так не подключено"
+        else:
+            name = st["saved"].get(active["ssid"])
+            code, _, err = nm("connection", "down", "id",
+                              name or active["ssid"], timeout=20)
+            st["msg"] = "отключено" if code == 0 else "не вышло: " + short_err(err)
+            refresh(st)
+
+    elif action == "forget" and cur:
+        name = st["saved"].get(cur["ssid"])
+        if not name:
+            st["msg"] = "эта сеть и не сохранена"
+        elif ask_yes(stdscr, f"Забыть «{name}»?"):
+            code, _, err = nm("connection", "delete", "id", name, timeout=15)
+            st["msg"] = "забыли" if code == 0 else "не вышло: " + short_err(err)
+            refresh(st)
+        else:
+            st["msg"] = "отменено"
+
+    elif action == "password" and cur:
+        name = st["saved"].get(cur["ssid"])
+        if not name:
+            st["msg"] = "сеть не сохранена — подключись обычным способом"
+        else:
+            pw = prompt(stdscr, f"новый пароль для «{name}»: ", mask=True)
+            if pw is None:
+                st["msg"] = "отменено"
+            else:
+                code, _, err = nm("connection", "modify", name,
+                                  "wifi-sec.key-mgmt", "wpa-psk",
+                                  "wifi-sec.psk", pw, timeout=15)
+                if code == 0:
+                    nm("-w", "20", "connection", "up", "id", name, timeout=25)
+                    st["msg"] = "пароль сохранён"
+                else:
+                    st["msg"] = "не вышло: " + short_err(err)
+                refresh(st)
+
+    elif action == "auto" and cur:
+        name = st["saved"].get(cur["ssid"])
+        if not name:
+            st["msg"] = "сеть не сохранена"
+        else:
+            now = nm("-g", "connection.autoconnect", "connection", "show", name)[1]
+            new = "no" if now == "yes" else "yes"
+            code, _, err = nm("connection", "modify", name,
+                              "connection.autoconnect", new, timeout=15)
+            st["msg"] = ("автоподключение " + ("включено" if new == "yes" else "выключено")
+                         if code == 0 else "не вышло: " + short_err(err))
+
+    elif action == "hidden":
+        ssid = prompt(stdscr, "имя скрытой сети: ")
+        if not ssid:
+            st["msg"] = "отменено"
+        else:
+            pw = prompt(stdscr, f"пароль для «{ssid}» (пусто — открытая): ", mask=True)
+            if pw is None:
+                st["msg"] = "отменено"
+            else:
+                st["msg"] = f"подключаюсь к «{ssid}»…"
+                draw(stdscr, st)
+                st["msg"] = connect({"ssid": ssid, "bssid": "", "sec": "WPA2"},
+                                    {}, pw or None, hidden=True)
+                refresh(st)
+
+    elif action == "radio":
+        new = "off" if st["radio"] else "on"
+        code, _, err = nm("radio", "wifi", new, timeout=15)
+        st["msg"] = ("Wi-Fi " + ("выключен" if new == "off" else "включён")
+                     if code == 0 else "не вышло: " + short_err(err))
+        time.sleep(0.6)
+        refresh(st)
+
+    elif action == "rescan":
+        st["msg"] = "ищу сети…"
+        draw(stdscr, st)
+        refresh(st, rescan=True)
+        st["msg"] = f"нашлось сетей: {len(st['nets'])}"
+
+    elif action == "info":
+        overlay(stdscr, "ПОДКЛЮЧЕНИЕ", info_rows())
+
+    elif action == "help":
+        overlay(stdscr, "КЛАВИШИ И МЫШЬ", HELP)
+
+    return False
+
+
+def hit(st, name, cy, cx):
+    z = st["zones"].get(name)
+    return bool(z) and cy == z[0] and z[1] <= cx <= z[2]
+
+
+def on_mouse(stdscr, st):
+    """Мышь: выбор, двойной клик — подключить, правая — меню, колесо — прокрутка."""
+    try:
+        _, cx, cy, _, bstate = curses.getmouse()
+    except curses.error:
+        return False
+    up = curses.BUTTON4_PRESSED
+    down = getattr(curses, "BUTTON5_PRESSED", 0x200000)
+    if bstate & up:
+        st["sel"] = max(0, st["sel"] - 3)
+        return False
+    if bstate & down:
+        st["sel"] = min(len(st["nets"]) - 1, st["sel"] + 3)
+        return False
+
+    right = bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_RELEASED
+                      | curses.BUTTON3_CLICKED)
+    if cy in st["rowmap"]:
+        st["sel"] = st["rowmap"][cy]
+    if right:
+        choice = menu(stdscr, cy, cx, row_menu(st), "ДЕЙСТВИЯ")
+        return act(stdscr, st, choice) if choice else False
+    if hit(st, "quit", cy, cx):
+        return True
+    if hit(st, "radio", cy, cx):
+        return act(stdscr, st, "radio")
+    if hit(st, "menu", cy, cx):
+        choice = menu(stdscr, max(0, cy - len(row_menu(st)) - 1), cx,
+                      row_menu(st), "ДЕЙСТВИЯ")
+        return act(stdscr, st, choice) if choice else False
+
+    if cy in st["rowmap"]:                       # двойной клик — подключить
+        now = time.time()
+        same = st.get("click") == (st["sel"],) and now - st.get("click_at", 0) < 0.5
+        st["click"], st["click_at"] = (st["sel"],), now
+        if same or bstate & curses.BUTTON1_DOUBLE_CLICKED:
+            cur = st["nets"][st["sel"]]
+            return act(stdscr, st, "disconnect" if cur["in_use"] else "connect")
+    return False
+
+
+def tui(stdscr):
+    curses.curs_set(0)
+    try: curses.set_escdelay(25)      # иначе Esc срабатывает через секунду
+    except Exception: pass
+    init_colors()
+    stdscr.keypad(True)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    curses.mouseinterval(200)
+    st = {"nets": [], "saved": {}, "radio": True, "sel": 0, "msg": "",
+          "stamp": 0, "hidden": 0, "zones": {}, "rowmap": {}}
+    refresh(st)
+
+    while True:
+        draw(stdscr, st)
+        st["msg"] = ""
+        stdscr.timeout(3000)                     # сами обновляем сигнал
+        try:
+            ch = stdscr.get_wch()
+        except curses.error:
+            ch = -1
+        if ch == -1:
+            if time.time() - st["stamp"] > 5:
+                refresh(st)
+            continue
+        ch = key(ch)
+        stdscr.timeout(-1)
+
+        if ch == curses.KEY_MOUSE:
+            if on_mouse(stdscr, st):
+                break
+            continue
+        if ch in ("q", "Q", "\x1b"):
+            break
+        elif ch in ("j", curses.KEY_DOWN):
+            st["sel"] += 1
+        elif ch in ("k", curses.KEY_UP):
+            st["sel"] -= 1
+        elif ch == curses.KEY_HOME:
+            st["sel"] = 0
+        elif ch == curses.KEY_END:
+            st["sel"] = len(st["nets"]) - 1
+        elif ch == curses.KEY_NPAGE:
+            st["sel"] += 5
+        elif ch == curses.KEY_PPAGE:
+            st["sel"] -= 5
+        else:
+            keymap = {"\n": "connect", "\r": "connect", curses.KEY_ENTER: "connect",
+                      "d": "disconnect", "D": "disconnect",
+                      "f": "forget", "F": "forget", curses.KEY_DC: "forget",
+                      "p": "password", "P": "password", "a": "auto", "A": "auto",
+                      "n": "hidden", "N": "hidden", "w": "radio", "W": "radio",
+                      "r": "rescan", "R": "rescan", curses.KEY_F5: "rescan",
+                      "i": "info", "I": "info", "?": "help", "/": "help"}
+            action = keymap.get(ch)
+            if action and act(stdscr, st, action):
+                break
+
+
+# ─── окно ───────────────────────────────────────────────────────────────────
+def hypr(*args):
+    try:
+        return subprocess.run(["hyprctl", *args], capture_output=True,
+                              text=True).stdout
+    except FileNotFoundError:
+        return ""
+
+
+def toggle():
+    """Второй клик по значку закрывает панель. Соседнюю панель убираем."""
+    import json
+    try:
+        clients = json.loads(hypr("clients", "-j"))
+        active_ws = json.loads(hypr("activeworkspace", "-j"))["id"]
+    except (ValueError, KeyError):
+        clients, active_ws = [], None
+
+    for c in clients:                          # открыта одна панель за раз
+        if c.get("class") in SIBLINGS:
+            hypr("dispatch", "closewindow", f"address:{c['address']}")
+
+    mine = [c for c in clients if c.get("class") == CLASS]
+    here = [c for c in mine if c.get("workspace", {}).get("id") == active_ws]
+    if here:
+        for c in here:
+            hypr("dispatch", "closewindow", f"address:{c['address']}")
+    elif mine:
+        hypr("dispatch", "movetoworkspace", f"{active_ws},address:{mine[0]['address']}")
+        hypr("dispatch", "focuswindow", f"address:{mine[0]['address']}")
+    else:
+        subprocess.Popen(["kitty", "--class", CLASS, "-e",
+                          os.path.abspath(__file__)], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cli_status():
+    if not radio_on():
+        print("Wi-Fi выключен")
+        return
+    cur = next((n for n in scan() if n["in_use"]), None)
+    if not cur:
+        print("не подключено")
+        return
+    ip = (link_info().get("IP4.ADDRESS[1]") or ["—"])[0]
+    print(f"{label_of(cur)} · {cur['signal']}% · {ip}")
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "--toggle":
+        toggle()
+    elif arg == "status":
+        cli_status()
+    elif arg in ("-h", "--help"):
+        print(__doc__)
+    else:
+        try:
+            curses.wrapper(tui)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            try:
+                input("Нажми Enter, чтобы закрыть…")
+            except EOFError:
+                pass
+
+
+if __name__ == "__main__":
+    main()

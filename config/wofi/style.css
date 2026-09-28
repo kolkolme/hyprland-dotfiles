@@ -1,0 +1,29 @@
+/* wofi — палитра Catppuccin Mocha, как у Waybar */
+window {
+  margin: 0;
+  border: 2px solid #c7b3c5;
+  border-radius: 16px;
+  background-color: rgba(31, 30, 31, 0.88);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+}
+#input {
+  margin: 10px;
+  padding: 10px 14px;
+  border: 1px solid rgba(199, 179, 197, 0.35);
+  border-radius: 12px;
+  color: #e2dfe2;
+  background-color: rgba(60, 57, 60, 0.6);
+}
+#input:focus { border-color: #d7ccd4; box-shadow: none; }
+#inner-box { margin: 4px 10px 10px; background-color: transparent; }
+#outer-box { margin: 0; background-color: transparent; }
+#scroll    { margin: 0; }
+#entry     { padding: 6px 10px; border-radius: 10px; }
+#entry image { margin-right: 8px; }
+#text      { color: #e2dfe2; }
+#entry:selected {
+  background: linear-gradient(90deg, #c7b3c5, #d7ccd4);
+  outline: none;
+}
+#entry:selected #text { color: #272527; font-weight: bold; }

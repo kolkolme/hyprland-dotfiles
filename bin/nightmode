@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Ночной режим экрана через hyprsunset.
+#   nightmode status — JSON для Waybar (в режиме «авто» ещё и подстраивает температуру)
+#   nightmode next | prev — переключить режим по кругу
+#   nightmode set off|warm|night|auto
+#   nightmode apply — применить сохранённый режим (при старте)
+STATE="$HOME/.cache/nightmode"
+MODES=(off warm night auto)
+
+mode() { local m; m=$(cat "$STATE" 2>/dev/null); [[ " ${MODES[*]} " == *" $m "* ]] && echo "$m" || echo off; }
+
+# температура для режима (0 = без фильтра)
+temp_for() {
+    case $1 in
+        warm)  echo 4800 ;;
+        night) echo 3500 ;;
+        auto)  local h=$((10#$(date +%H)))
+               if   (( h >= 22 || h < 7 )); then echo 3500
+               elif (( h >= 20 ));          then echo 4800
+               else echo 0; fi ;;
+        *)     echo 0 ;;
+    esac
+}
+
+apply() {
+    pgrep -x hyprsunset >/dev/null || { hyprsunset >/dev/null 2>&1 & sleep 0.5; }
+    local t; t=$(temp_for "$(mode)")
+    [[ $t == "$(cat "$STATE.applied" 2>/dev/null)" ]] && return
+    if (( t == 0 )); then hyprctl hyprsunset temperature 6500 >/dev/null   # 6500K = без фильтра
+    else hyprctl hyprsunset temperature "$t" >/dev/null; fi
+    echo "$t" > "$STATE.applied"
+}
+
+set_mode() { mkdir -p "${STATE%/*}"; echo "$1" > "$STATE"; rm -f "$STATE.applied"; apply; pkill -RTMIN+9 -x waybar; }
+
+shift_mode() {
+    local cur i; cur=$(mode)
+    for i in "${!MODES[@]}"; do [[ ${MODES[$i]} == "$cur" ]] && break; done
+    set_mode "${MODES[$(( (i + $1 + ${#MODES[@]}) % ${#MODES[@]} ))]}"
+}
+
+status() {
+    apply
+    local m t icon name; m=$(mode); t=$(temp_for "$m")
+    case $m in
+        off)   icon=$''; name="Обычный" ;;
+        warm)  icon=$''; name="Тёплый" ;;
+        night) icon=$''; name="Ночной" ;;
+        auto)  icon=$''; name="Авто" ;;
+    esac
+    local now; (( t == 0 )) && now="без фильтра" || now="${t}K"
+    printf '{"text":"%s","alt":"%s","class":"%s","tooltip":"Режим экрана: %s (%s)\\nЛКМ — следующий · ПКМ — предыдущий\\nОбычный → Тёплый → Ночной → Авто"}\n' \
+        "$icon" "$m" "$m" "$name" "$now"
+}
+
+case ${1:-status} in
+    status) status ;;
+    next)   shift_mode 1 ;;
+    prev)   shift_mode -1 ;;
+    set)    set_mode "${2:-off}" ;;
+    apply)  rm -f "$STATE.applied"; apply ;;
+esac

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Игры и игрушки.
+#   games        — меню выбора (Super+G)
+#   games toys   — все терминальные игрушки сразу на отдельном рабочем столе «toys»
+#   games toys quiet — то же, но без перехода на этот стол
+#   games bonsai|pipes|matrix|clock — одна игрушка в новом окне
+#   games off   — погасить игрушки и добить осиротевшие процессы
+#                 «games off clock» оставит часы в живых
+STEAMAPPS="$HOME/.steam/steam/steamapps"
+
+declare -A TOY=(
+    [bonsai]="cbonsai -l -i -t 0.04"
+    [pipes]="/usr/games/pipes -p 3 -t 1 -r 4000"
+    [matrix]="cmatrix -ab -u 4"
+    [clock]="tty-clock -c -s -C 5 -b"
+)
+ORDER=(bonsai pipes matrix clock)
+declare -A TOY_NAME=(
+    [bonsai]="🌳  Бонсай"   [pipes]="🟪  Трубы"
+    [matrix]="💚  Матрица"  [clock]="🕐  Часы"
+)
+ALL="✨  Все игрушки сразу"
+QUIT="⏻  Выйти из Steam"
+
+# Игрушки — это бесконечные циклы в терминале. Если закрыть окно kitty,
+# сам цикл нередко переживает своё окно: родителем становится init, окна нет,
+# а CPU он жрёт как ни в чём не бывало. Такие сироты копятся сессиями,
+# поэтому перед каждым запуском и по команде «games off» их отстреливаем.
+TOY_PROCS='/usr/games/pipes|cbonsai|cmatrix|tty-clock'
+
+reap_orphans() {
+    local p
+    for p in $(pgrep -f "$TOY_PROCS" 2>/dev/null); do
+        # у живой игрушки родитель — её окно kitty; у осиротевшей родитель 1
+        [ "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" = "1" ] || continue
+        [ "$(ps -o comm= -p "$p" 2>/dev/null)" = "kitty" ] && continue   # само окно не трогаем
+        kill -9 "$p" 2>/dev/null
+    done
+}
+
+toy() {
+    reap_orphans
+    pkill -f "kitty --class toy-$1" 2>/dev/null   # не плодить второе такое же окно
+    kitty --class "toy-$1" -e ${TOY[$1]} >/dev/null 2>&1 &
+}
+
+# all_toys        — запустить все и перейти на стол «toys»
+# all_toys quiet  — запустить молча, не уводя взгляд с текущего стола
+#                   (так их возвращает powerguard, когда воткнули зарядку)
+all_toys() {
+    local quiet=${1:-} running t
+    reap_orphans
+    # Запускаем только недостающие. Раньше здесь была проверка «есть хоть одна
+    # игрушка — значит всё запущено», и после разряда часы (их мы не гасим)
+    # не давали вернуть остальные.
+    running=$(hyprctl clients -j | grep -o '"class": "toy-[a-z]*"' | sed 's/.*toy-//; s/"//')
+    for t in "${ORDER[@]}"; do
+        printf '%s\n' "$running" | grep -qx "$t" || { toy "$t"; sleep 0.4; }
+    done
+    [ "$quiet" = quiet ] || hyprctl dispatch workspace name:toys >/dev/null
+}
+
+# Чем прибивать каждую игрушку по отдельности.
+declare -A TOY_PROC=(
+    [bonsai]="cbonsai"
+    [pipes]="/usr/games/pipes"
+    [matrix]="cmatrix"
+    [clock]="tty-clock"
+)
+
+toy_kill() {
+    pkill -f "kitty --class toy-$1" 2>/dev/null
+    sleep 0.2
+    pkill -9 -f "${TOY_PROC[$1]}" 2>/dev/null
+    return 0
+}
+
+# Погасить игрушки: и окна, и оставшиеся от них циклы.
+#   all_off              — все
+#   all_off clock        — все, кроме часов
+#   all_off --keep clock — то же самое, просто явнее
+all_off() {
+    local keep=" " t
+    for t in "$@"; do [ "$t" = "--keep" ] && continue; keep+="$t "; done
+    for t in "${ORDER[@]}"; do
+        [[ $keep == *" $t "* ]] && continue
+        toy_kill "$t"
+    done
+    reap_orphans   # сироты без окон не жалко никогда
+}
+
+# игры Steam: «appid<TAB>название», без Proton, рантаймов и Wallpaper Engine
+steam_games() {
+    for f in "$STEAMAPPS"/appmanifest_*.acf; do
+        [[ -e $f ]] || continue
+        id=$(grep -oP '"appid"\s+"\K[0-9]+' "$f")
+        name=$(grep -oP '"name"\s+"\K[^"]+' "$f")
+        [[ $name =~ ^(Proton|Steam Linux Runtime|Steamworks|Wallpaper Engine) ]] && continue
+        printf '%s\t%s\n' "$id" "$name"
+    done | sort -t$'\t' -k2
+}
+
+menu() {
+    local games choice id
+    games=$(steam_games)
+    choice=$( {
+        pgrep -x steam >/dev/null && echo "$QUIT"
+        echo "$ALL"
+        for t in "${ORDER[@]}"; do echo "${TOY_NAME[$t]}"; done
+        [[ -n $games ]] && cut -f2 <<<"$games" | sed 's/^/🎮  /'
+    } | wofi --dmenu --prompt "Во что играем?" --width 420 --height 360 --cache-file /dev/null )
+    [[ -z $choice ]] && exit 0
+    [[ $choice == "$QUIT" ]] && { ~/.local/bin/steam-quit; exit; }
+    [[ $choice == "$ALL" ]] && { all_toys; exit; }
+    for t in "${ORDER[@]}"; do [[ $choice == "${TOY_NAME[$t]}" ]] && { toy "$t"; exit; }; done
+    id=$(awk -F'\t' -v n="${choice#🎮  }" '$2 == n {print $1}' <<<"$games")
+    [[ -n $id ]] && { steam "steam://rungameid/$id" >/dev/null 2>&1 & disown; }
+}
+
+case ${1:-menu} in
+    menu) menu ;;
+    toys) shift; all_toys "${1:-}" ;;
+    off|stop) shift; all_off "$@" ;;
+    bonsai|pipes|matrix|clock) toy "$1" ;;
+    *) echo "games [menu|toys|off [что оставить]|bonsai|pipes|matrix|clock]"; exit 1 ;;
+esac

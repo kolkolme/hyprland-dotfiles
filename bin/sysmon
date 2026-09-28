@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""sysmon — данные о нагрузке для Waybar, посчитанные как у системных утилит.
+
+  sysmon cpu   JSON: загрузка процессора (как top: 100 − idle)
+  sysmon mem   JSON: занятая память (как free: без кеша и буферов)
+
+Почему не встроенные модули Waybar: его memory считает занятым всё, кроме
+MemAvailable, и приписывает к расходу дисковый кеш — на этой машине выходило
+51% вместо 36%. CPU он усредняет по своему интервалу, здесь же окно совпадает
+с интервалом опроса, так что число сходится с top.
+"""
+import json, os, sys, time
+
+STATE = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/sysmon-cpu"
+
+
+def meminfo():
+    m = {}
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":", 1)
+        m[k] = int(v.split()[0])          # КиБ
+    return m
+
+
+def cpu_times():
+    f = open("/proc/stat").readline().split()[1:]
+    v = [int(x) for x in f]
+    idle = v[3] + v[4]                    # idle + iowait
+    return sum(v), idle
+
+
+def top_procs(by, n=3):
+    """Три самых прожорливых процесса: (имя, значение). Себя не считаем."""
+    out = os.popen(f"ps -eo comm=,{by}= --sort=-{by} | grep -v '^python3' | head -{n}").read()
+    res = []
+    for line in out.strip().split("\n"):
+        if not line.strip():
+            continue
+        parts = line.rsplit(None, 1)
+        if len(parts) == 2:
+            res.append((parts[0][:18], parts[1]))
+    return res
+
+
+def cpu():
+    total, idle = cpu_times()
+    prev = None
+    try:
+        with open(STATE) as f:
+            p = f.read().split()
+            prev = (int(p[0]), int(p[1]))
+    except (OSError, ValueError, IndexError):
+        pass
+    with open(STATE, "w") as f:
+        f.write(f"{total} {idle}")
+
+    if prev and total > prev[0]:
+        busy = 100 * (1 - (idle - prev[1]) / (total - prev[0]))
+    else:                                  # первый запуск — взять мгновенный срез
+        t0, i0 = cpu_times(); time.sleep(0.25); t1, i1 = cpu_times()
+        busy = 100 * (1 - (i1 - i0) / max(1, t1 - t0))
+    busy = max(0.0, min(100.0, busy))
+
+    la = open("/proc/loadavg").read().split()[:3]
+    cores = os.cpu_count() or 1
+    word = "поток" if cores % 10 == 1 and cores % 100 != 11 else \
+           "потока" if cores % 10 in (2, 3, 4) and cores % 100 not in (12, 13, 14) else "потоков"
+    tip = [f"Загрузка процессора: {busy:.0f}%",
+           f"Средняя за 1/5/15 мин: {la[0]} · {la[1]} · {la[2]}   ({cores} {word})",
+           "",
+           "Больше всех съели за время работы:"]
+    for name, val in top_procs("pcpu"):
+        tip.append(f"  {name:<18} {val}%")
+    cls = "critical" if busy >= 85 else "warning" if busy >= 60 else "normal"
+    print(json.dumps({"text": f"{busy:.0f}%", "class": cls,
+                      "tooltip": "\n".join(tip)}, ensure_ascii=False))
+
+
+def mem():
+    m = meminfo()
+    total = m["MemTotal"]
+    # ровно та же формула, что у утилиты free в колонке used
+    used = total - m["MemFree"] - m["Buffers"] - m["Cached"] - m.get("SReclaimable", 0)
+    cache = m["Buffers"] + m["Cached"] + m.get("SReclaimable", 0)
+    avail = m["MemAvailable"]
+    pct = used * 100 / total
+    g = lambda kb: kb / 1048576
+
+    tip = [f"Занято: {g(used):.1f} из {g(total):.1f} ГиБ  ({pct:.0f}%)",
+           f"Кеш и буферы: {g(cache):.1f} ГиБ — освободятся по требованию",
+           f"Доступно приложениям: {g(avail):.1f} ГиБ"]
+    sw_t, sw_f = m.get("SwapTotal", 0), m.get("SwapFree", 0)
+    if sw_t:
+        tip.append(f"Подкачка: {g(sw_t - sw_f):.1f} из {g(sw_t):.1f} ГиБ")
+    tip.append("")
+    tip.append("Больше всех занимают сейчас:")
+    for name, val in top_procs("pmem"):
+        tip.append(f"  {name:<18} {val}%")
+    cls = "critical" if pct >= 90 else "warning" if pct >= 75 else "normal"
+    print(json.dumps({"text": f"{pct:.0f}%", "class": cls,
+                      "tooltip": "\n".join(tip)}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    a = sys.argv[1] if len(sys.argv) > 1 else ""
+    if a == "cpu":
+        cpu()
+    elif a == "mem":
+        mem()
+    else:
+        print(__doc__)

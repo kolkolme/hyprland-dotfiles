@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""english <файл>  — измеряет качество письменного английского и пишет историю.
+
+  english text.md        проверить файл
+  english --history      показать динамику
+  english --add слово    добавить слово в личный словарь (не считать ошибкой)
+"""
+import os, re, subprocess, sys, datetime, pathlib
+
+HOME = pathlib.Path.home()
+DATA = HOME / ".local/share/english"
+HIST = DATA / "history.tsv"
+IGN  = DATA / "ignore.txt"
+DATA.mkdir(parents=True, exist_ok=True)
+
+
+def ignored():
+    if not IGN.exists():
+        return set()
+    return {w.strip().lower() for w in IGN.read_text().splitlines() if w.strip()}
+
+
+def check(text):
+    try:
+        out = subprocess.run(["aspell", "list", "--lang=en"], input=text,
+                             capture_output=True, text=True, check=True).stdout
+    except FileNotFoundError:
+        sys.exit("нужен aspell:  sudo apt install aspell aspell-en")
+    skip = ignored()
+    bad = sorted({w for w in out.split()
+                  if w.lower() not in skip and not w.isdigit() and len(w) > 1})
+    words = re.findall(r"[A-Za-z']+", text)
+    return words, bad
+
+
+def history():
+    if not HIST.exists():
+        return []
+    rows = []
+    for line in HIST.read_text().splitlines():
+        p = line.split("\t")
+        if len(p) == 5:
+            rows.append((p[0], p[1], int(p[2]), int(p[3]), float(p[4])))
+    return rows
+
+
+def show_history():
+    rows = history()
+    if not rows:
+        print("истории пока нет — проверь хоть один файл")
+        return
+    print(f"{'дата':<12}{'текст':<22}{'слов':>7}{'ошибок':>8}{'на 1000':>9}")
+    print("-" * 58)
+    for d, name, w, e, rate in rows:
+        print(f"{d:<12}{name[:21]:<22}{w:>7}{e:>8}{rate:>9.1f}")
+    if len(rows) > 1:
+        first, last = rows[0][4], rows[-1][4]
+        if first:
+            diff = (last - first) / first * 100
+            word = "лучше" if diff < 0 else "хуже"
+            print(f"\nот первого замера: {abs(diff):.0f}% {word} "
+                  f"({first:.1f} → {last:.1f} ошибок на 1000 слов)")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    if args[0] == "--history":
+        show_history(); return
+    if args[0] == "--add":
+        if len(args) < 2:
+            sys.exit("укажи слово: english --add слово")
+        with IGN.open("a") as f:
+            for w in args[1:]:
+                f.write(w.lower() + "\n")
+        print("добавлено в словарь:", ", ".join(args[1:]))
+        return
+
+    path = pathlib.Path(args[0])
+    if not path.is_file():
+        sys.exit(f"нет файла: {path}")
+    text = path.read_text(errors="replace")
+    words, bad = check(text)
+    n = len(words)
+    if n == 0:
+        sys.exit("в файле нет слов")
+    rate = len(bad) / n * 1000
+
+    print(f"\n  файл:       {path.name}")
+    print(f"  слов:       {n}")
+    print(f"  ошибок:     {len(bad)} уникальных")
+    print(f"  плотность:  {rate:.1f} на 1000 слов")
+
+    rows = history()
+    if rows:
+        base = rows[0]
+        print(f"\n  базовый замер ({base[0]}, {base[1]}): {base[4]:.1f} на 1000")
+        if base[4]:
+            d = (rate - base[4]) / base[4] * 100
+            print(f"  сейчас: {abs(d):.0f}% {'лучше' if d < 0 else 'хуже'}")
+
+    if bad:
+        print("\n  ошибки:")
+        for i in range(0, min(len(bad), 40), 6):
+            print("    " + "  ".join(bad[i:i+6]))
+        if len(bad) > 40:
+            print(f"    … и ещё {len(bad)-40}")
+
+    with HIST.open("a") as f:
+        today = datetime.date.today().isoformat()
+        f.write(f"{today}\t{path.name}\t{n}\t{len(bad)}\t{rate:.2f}\n")
+    print()
+
+
+if __name__ == "__main__":
+    main()

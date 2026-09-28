@@ -1,0 +1,94 @@
+# Пакеты для сборки рабочего стола. Ставятся через install.sh.
+# Базовая система (libc6, bash, coreutils...) сюда намеренно не включена.
+
+# --- Hyprland и компоненты ---
+hyprland
+hypridle
+hyprlock
+hyprpaper
+hyprsunset
+xdg-desktop-portal-hyprland
+xdg-desktop-portal-gtk
+qt6-wayland
+
+# --- панель, меню, уведомления, выход ---
+waybar
+wofi
+wlogout
+sway-notification-center
+mako-notifier
+
+# --- оболочка zsh ---
+zsh
+zsh-syntax-highlighting
+zsh-autosuggestions
+
+# --- терминал и оболочка ---
+kitty
+starship
+eza
+bat
+fzf
+zoxide
+fastfetch
+
+# --- буфер, скриншоты, мультимедиа-клавиши ---
+wl-clipboard
+cliphist
+grim
+slurp
+brightnessctl
+playerctl
+
+# --- звук ---
+pipewire
+wireplumber
+pavucontrol
+alsa-utils
+
+# --- сеть, bluetooth, VPN ---
+network-manager-gnome
+network-manager-openconnect
+network-manager-openconnect-gnome
+openconnect
+bluez
+iw
+
+# --- нужно самописным скриптам из bin/ ---
+python3
+python3-pil
+imagemagick
+libnotify-bin
+aspell
+aspell-en
+
+# --- шрифты и темы ---
+fonts-jetbrains-mono
+fonts-font-awesome
+fonts-nerd-symbols
+fonts-noto-color-emoji
+fonts-inter
+nwg-look
+
+# --- нужно функциям и алиасам из shell/zshrc ---
+curl
+unzip
+unrar-free
+p7zip-full
+
+# --- игрушки для терминала (алиасы bonsai/matrix/pipes/clock) ---
+cbonsai
+cmatrix
+pipes-sh
+tty-clock
+
+# --- питание и датчики (ноутбук) ---
+tlp
+thermald
+powertop
+
+# --- запрос пароля для GUI ---
+mate-polkit
+
+# --- дисплей-менеджер ---
+sddm

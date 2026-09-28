@@ -1,0 +1,260 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 36,
+  "margin-top": 6,
+  "margin-left": 10,
+  "margin-right": 10,
+  "spacing": 2,
+  "modules-left": [
+    "hyprland/workspaces",
+    "hyprland/window"
+  ],
+  "modules-center": [
+    "clock",
+    "mpris"
+  ],
+  "modules-right": [
+    "custom/wallpaper",
+    "tray",
+    "hyprland/language",
+    "pulseaudio",
+    "backlight",
+    "network",
+    "bluetooth",
+    "custom/vpn",
+    "custom/cpu",
+    "custom/memory",
+    "temperature",
+    "battery",
+    "custom/nightmode",
+    "custom/notifications",
+    "custom/power"
+  ],
+  "hyprland/workspaces": {
+    "format": "{icon}",
+    "on-click": "activate",
+    "sort-by-number": true,
+    "persistent-workspaces": {
+      "*": 5
+    },
+    "format-icons": {
+      "1": "1",
+      "2": "2",
+      "3": "3",
+      "4": "4",
+      "5": "5",
+      "6": "6",
+      "7": "7",
+      "8": "8",
+      "9": "9",
+      "10": "10",
+      "11": "11",
+      "12": "12",
+      "13": "13",
+      "14": "14",
+      "15": "15",
+      "16": "16",
+      "17": "17",
+      "18": "18",
+      "19": "19",
+      "20": "20",
+      "toys": "",
+      "default": ""
+    }
+  },
+  "hyprland/window": {
+    "format": "{title}",
+    "max-length": 24,
+    "separate-outputs": true
+  },
+  "hyprland/language": {
+    "format": " {short}",
+    "on-click": "hyprctl switchxkblayout current next"
+  },
+  "clock": {
+    "format": "  {:%H:%M     %a %d %b}",
+    "format-alt": "  {:%d.%m.%Y}",
+    "on-click": "~/.local/bin/calendar --toggle",
+    "on-click-right": "mode",
+    "tooltip-format": "<tt>{calendar}</tt>",
+    "calendar": {
+      "mode": "month",
+      "weeks-pos": "",
+      "format": {
+        "months": "<span color='#c7b3c5'><b>{}</b></span>",
+        "weekdays": "<span color='#89b4fa'><b>{}</b></span>",
+        "today": "<span color='#d7ccd4'><b><u>{}</u></b></span>"
+      }
+    }
+  },
+  // считает как top: 100 − idle за интервал опроса, а не «с момента загрузки»
+  "custom/cpu": {
+    "exec": "~/.local/bin/sysmon cpu",
+    "return-type": "json",
+    "interval": 3,
+    "format": "\uf2db  {}",
+    "on-click": "kitty -e top"
+  },
+  // считает как free: кеш и буферы занятыми НЕ считаются
+  "custom/memory": {
+    "exec": "~/.local/bin/sysmon mem",
+    "return-type": "json",
+    "interval": 5,
+    "format": "\uf538  {}",
+    "on-click": "kitty -e top -o %MEM"
+  },
+  "temperature": {
+    "critical-threshold": 82,
+    "format": "  {temperatureC}°",
+    "format-critical": "  {temperatureC}°"
+  },
+  "backlight": {
+    "format": "  {percent}%",
+    "device": "intel_backlight",
+    "smooth-scrolling-threshold": 1,
+    "tooltip-format": "Яркость {percent}%  ·  колесо вверх/вниз",
+    "on-scroll-up": "brightnessctl -e4 -n2 set 5%+",
+    "on-scroll-down": "brightnessctl -e4 -n2 set 5%-"
+  },
+  "battery": {
+    "states": {
+      "warning": 25,
+      "critical": 12
+    },
+    "format": "{icon}  {capacity}%",
+    "format-charging": "  {capacity}%",
+    "format-plugged": "  {capacity}%",
+    "format-icons": [
+      "",
+      "",
+      "",
+      "",
+      ""
+    ],
+    "tooltip-format": "{timeTo}"
+  },
+  // Wi-Fi: ЛКМ — своя панель (~/.local/bin/wifi), ПКМ — поиск сетей, СКМ — редактор NM.
+  "network": {
+    "format-wifi": " {signalStrength}%",
+    "format-disconnected": "",
+    "tooltip-format": "{ifname}: {ipaddr}/{cidr}  ·  {signalStrength}%",
+    "on-click": "~/.local/bin/wifi --toggle",
+    "on-click-right": "nmcli device wifi rescan",
+    "on-click-middle": "nm-connection-editor",
+    "tooltip-format-disconnected": "Не подключено\nЛКМ — выбрать сеть",
+    "tooltip-format-wifi": "{essid} · {signalStrength}%\n{ipaddr}/{cidr}",
+    "interface": "wlan0"
+  },
+  "pulseaudio": {
+    "format": "{icon}  {volume}%",
+    "format-muted": "  выкл",
+    "format-icons": {
+      "headphone": "",
+      "default": [
+        "",
+        "",
+        ""
+      ]
+    },
+    "on-click": "pavucontrol",
+    "on-click-right": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
+  },
+  "tray": {
+    "icon-size": 15,
+    "spacing": 8
+  },
+  "custom/wallpaper": {
+    "exec": "~/.local/bin/wallpick status",
+    "return-type": "json",
+    "interval": "once",
+    "signal": 8,
+    "on-click": "~/.local/bin/wallpick",
+    "on-click-right": "~/.local/bin/wallpick random",
+    "on-click-middle": "thunar ~/Pictures/wallpapers"
+  },
+  "custom/power": {
+    "format": "",
+    "tooltip": false,
+    "on-click": "wlogout -b 5 -T 380 -B 380"
+  },
+  "mpris": {
+    "format": "{player_icon}  {dynamic}",
+    "format-paused": "{status_icon}  <i>{dynamic}</i>",
+    "dynamic-order": [
+      "artist",
+      "title"
+    ],
+    "dynamic-len": 40,
+    "dynamic-separator": " — ",
+    "player-icons": {
+      "default": "",
+      "firefox": "",
+      "spotify": "",
+      "mpv": "",
+      "chromium": ""
+    },
+    "status-icons": {
+      "paused": ""
+    },
+    "tooltip-format": "{player}: {artist} — {title}\nЛКМ пауза · ПКМ следующий · колесо громкость",
+    "on-click": "playerctl play-pause",
+    "on-click-right": "playerctl next",
+    "on-click-middle": "playerctl previous",
+    "on-scroll-up": "playerctl volume 0.05+",
+    "on-scroll-down": "playerctl volume 0.05-"
+  },
+  "custom/nightmode": {
+    "exec": "~/.local/bin/nightmode status",
+    "return-type": "json",
+    "interval": 60,
+    "signal": 9,
+    "on-click": "~/.local/bin/nightmode next",
+    "on-click-right": "~/.local/bin/nightmode prev"
+  },
+  "custom/notifications": {
+    "exec": "swaync-client -swb",
+    "return-type": "json",
+    "format": "{icon}",
+    "format-icons": {
+      "notification": " ●",
+      "none": "",
+      "dnd-notification": " ●",
+      "dnd-none": "",
+      "inhibited-notification": " ●",
+      "inhibited-none": "",
+      "dnd-inhibited-notification": " ●",
+      "dnd-inhibited-none": ""
+    },
+    "tooltip": false,
+    "on-click": "swaync-client -t -sw",
+    "on-click-right": "swaync-client -d -sw"
+  },
+  // Bluetooth: ЛКМ — своя панель (~/.local/bin/bt), ПКМ — питание, СКМ — blueman.
+  "bluetooth": {
+    "format": "\uf294",
+    "format-disabled": "\uf294",
+    "format-off": "\uf294",
+    "format-on": "\uf294",
+    "format-connected": "\uf294  {num_connections}",
+    "format-connected-battery": "\uf294  {device_battery_percentage}%",
+    "tooltip-format": "Bluetooth: {status}\nЛКМ — устройства · ПКМ — включить/выключить",
+    "tooltip-format-off": "Bluetooth выключен\nЛКМ — устройства · ПКМ — включить",
+    "tooltip-format-on": "Bluetooth включён, ничего не подключено\nЛКМ — устройства · ПКМ — выключить",
+    "tooltip-format-connected": "Подключено: {num_connections}\n{device_enumerate}\nЛКМ — устройства · ПКМ — выключить",
+    "tooltip-format-enumerate-connected": "  {device_alias}",
+    "tooltip-format-enumerate-connected-battery": "  {device_alias} · {device_battery_percentage}%",
+    "on-click": "~/.local/bin/bt --toggle",
+    "on-click-middle": "blueman-manager",
+    "on-click-right": "sh -c 'bluetoothctl show | grep -q \"Powered: yes\" && bluetoothctl power off || bluetoothctl power on'"
+  },
+
+  "custom/vpn": {
+    "exec": "~/.local/bin/vpn status",
+    "return-type": "json",
+    "interval": 5,
+    "signal": 8,
+    "on-click": "~/.local/bin/vpn toggle",
+    "on-click-right": "~/.local/bin/vpn menu"
+  }
+}

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Заблокировать экран: сначала английская раскладка (пароль латиницей), потом hyprlock.
+hyprctl switchxkblayout all 0 >/dev/null 2>&1
+pidof hyprlock >/dev/null || exec hyprlock

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# dim — приглушение экрана по бездействию, с гарантированным возвратом.
+#
+#   dim on      запомнить текущую яркость и плавно притушить
+#   dim off     плавно вернуть запомненную
+#   dim status  показать состояние
+#
+# Почему не «brightnessctl -s set 10 / -r»: у brightnessctl одна ячейка
+# сохранения. Если таймер сработает второй раз поверх уже притушенного
+# экрана, в неё запишется сама темнота — и возвращать будет нечего.
+# Здесь состояние лежит в своём файле и второй раз не перезаписывается.
+
+set -u
+STATE="${XDG_RUNTIME_DIR:-/tmp}/dim-brightness"
+DIM_PERCENT=12        # до скольки процентов от максимума тушим
+FADE_STEPS=14         # плавность перехода
+FADE_MS=25            # пауза между шагами
+
+max()  { brightnessctl max; }
+cur()  { brightnessctl get; }
+setb() { brightnessctl -q set "$1"; }
+
+fade_to() {
+    local from=$1 to=$2 i v
+    for ((i = 1; i <= FADE_STEPS; i++)); do
+        v=$(( from + (to - from) * i / FADE_STEPS ))
+        setb "$v"
+        sleep "0.0$FADE_MS"
+    done
+    setb "$to"
+}
+
+case "${1:-status}" in
+  on)
+    [ -f "$STATE" ] && exit 0                  # уже притушено — второй раз не трогаем
+    c=$(cur); m=$(max)
+    target=$(( m * DIM_PERCENT / 100 ))
+    [ "$c" -le "$target" ] && exit 0           # и так темнее некуда
+    printf '%s\n' "$c" > "$STATE"
+    fade_to "$c" "$target"
+    ;;
+  off)
+    [ -f "$STATE" ] || exit 0
+    saved=$(cat "$STATE"); rm -f "$STATE"
+    c=$(cur); m=$(max)
+    # если пока было темно, яркость крутили руками — уважаем выбор пользователя
+    limit=$(( m * (DIM_PERCENT + 5) / 100 ))
+    [ "$c" -gt "$limit" ] && exit 0
+    fade_to "$c" "$saved"
+    ;;
+  status)
+    if [ -f "$STATE" ]; then
+        echo "притушено · вернётся на $(cat "$STATE") из $(max)"
+    else
+        echo "обычная яркость: $(cur) из $(max)"
+    fi
+    ;;
+  *) echo "dim [on|off|status]"; exit 1 ;;
+esac

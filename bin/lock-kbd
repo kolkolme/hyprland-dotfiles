@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Для hyprlock: состояние основной клавиатуры.
+#   lock-kbd layout — EN / RU
+#   lock-kbd caps   — надпись, если включён Caps Lock; иначе пробел
+#                     (на пустой вывод hyprlock не обновляет надпись и оставляет старую)
+hyprctl devices | awk -v mode="${1:-layout}" '
+  /active keymap:/ { sub(/.*active keymap: /, ""); km = $0 }
+  /capsLock:/      { caps = $2 }
+  /main: yes/      { mk = km; mc = caps }
+  END {
+    if (mode == "caps") { print (mc == "yes") ? "⇪  CAPS LOCK" : " "; exit }
+    print (mk ~ /^Russian/) ? "RU" : (mk ~ /^English/) ? "EN" : toupper(substr(mk, 1, 2))
+  }'

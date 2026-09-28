@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Запуск Hyprland прямо из текстовой консоли, в обход LightDM.
+# В консоли сессия активна с самого начала — значит гонки с активацией VT нет.
+unset DISPLAY XAUTHORITY
+export XDG_CURRENT_DESKTOP=Hyprland
+export XDG_SESSION_DESKTOP=Hyprland
+echo "Запускаю Hyprland... (выход: SUPER+SHIFT+M)"
+exec start-hyprland

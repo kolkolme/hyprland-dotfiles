@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""calendar — календарь-виджет в терминале.
+
+  calendar          открыть
+  calendar --toggle открыть, а если уже открыт — закрыть (клик по часам)
+  calendar --month  вывести месяц в stdout, без интерактива
+
+Дни, на которые заведены задачи, отмечены точкой; выбранный день показывает
+свои дела внизу. Данные задач берутся из того же файла, что у «tasks».
+Цвета — из палитры терминала, поэтому wallpick перекрашивает и календарь.
+"""
+import calendar as cal, curses, json, locale, os, sys
+from datetime import date, timedelta
+
+locale.setlocale(locale.LC_ALL, "")
+
+TASKS = os.path.expanduser(os.environ.get("TASKS_FILE", "~/.local/share/tasks.json"))
+MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль",
+          "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+MONTHS_OF = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+             "августа", "сентября", "октября", "ноября", "декабря"]
+WEEK = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+WDAY = ["понедельник", "вторник", "среда", "четверг", "пятница",
+        "суббота", "воскресенье"]
+
+# клавиши по расположению: календарь слушается и в русской раскладке
+RU2EN = str.maketrans(
+    "йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,",
+    "qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?")
+
+
+def key(ch):
+    """Нажатие → латинский эквивалент.
+
+    Переводим только кириллицу: латиница и знаки препинания должны доходить
+    как есть, иначе «.» превратилась бы в «/» — она стоит на той же клавише."""
+    if isinstance(ch, str) and ch and ("а" <= ch.lower() <= "я" or ch.lower() == "ё"):
+        return ch.translate(RU2EN)
+    return ch
+
+
+def load_tasks():
+    """{дата: [задачи]} по незакрытым задачам со сроком."""
+    try:
+        with open(TASKS, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for t in data.get("tasks", []):
+        if t.get("done") or not t.get("due"):
+            continue
+        out.setdefault(t["due"], []).append(t)
+    return out
+
+
+def shift_month(d, delta):
+    m = d.month - 1 + delta
+    y = d.year + m // 12
+    m = m % 12 + 1
+    return d.replace(year=y, month=m, day=min(d.day, cal.monthrange(y, m)[1]))
+
+
+C_FRAME, C_TEXT, C_MUTED, C_TODAY, C_SEL, C_MARK, C_WEEKEND, C_HINT = range(1, 9)
+
+
+def colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_FRAME, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_TEXT, -1, -1)
+    curses.init_pair(C_MUTED, 8, -1)
+    curses.init_pair(C_TODAY, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_SEL, curses.COLOR_BLACK, curses.COLOR_MAGENTA)
+    curses.init_pair(C_MARK, curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_WEEKEND, curses.COLOR_RED, -1)
+    curses.init_pair(C_HINT, 8, -1)
+
+
+def draw(stdscr, cur, today, tasks):
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    stdscr.attrset(curses.color_pair(C_FRAME))
+    stdscr.box()
+
+    head = f" {MONTHS[cur.month - 1].upper()} {cur.year} "
+    stdscr.addstr(0, 2, head, curses.color_pair(C_FRAME) | curses.A_BOLD)
+
+    # шапка недели
+    x0 = 3
+    for i, d in enumerate(WEEK):
+        stdscr.addstr(2, x0 + i * 4, d,
+                      curses.color_pair(C_WEEKEND if i >= 5 else C_MUTED))
+
+    weeks = cal.Calendar(firstweekday=0).monthdatescalendar(cur.year, cur.month)
+    for r, week in enumerate(weeks):
+        y = 3 + r
+        if y >= h - 5:
+            break
+        for c, day in enumerate(week):
+            x = x0 + c * 4
+            txt = f"{day.day:>2}"
+            if day.month != cur.month:
+                attr = curses.color_pair(C_MUTED) | curses.A_DIM
+            elif day == cur:
+                attr = curses.color_pair(C_SEL) | curses.A_BOLD
+            elif day == today:
+                attr = curses.color_pair(C_TODAY) | curses.A_BOLD
+            elif c >= 5:
+                attr = curses.color_pair(C_WEEKEND)
+            else:
+                attr = curses.color_pair(C_TEXT)
+            try:
+                stdscr.addstr(y, x, txt, attr)
+                if tasks.get(day.isoformat()) and day.month == cur.month:
+                    stdscr.addstr(y, x + 2, "·", curses.color_pair(C_MARK)
+                                  | curses.A_BOLD)
+            except curses.error:
+                pass
+
+    # подпись выбранного дня и его дела
+    base = 4 + len(weeks)
+    label = f"{cur.day} {MONTHS_OF[cur.month - 1]}, {WDAY[cur.weekday()]}"
+    if cur == today:
+        label += "  — сегодня"
+    try:
+        stdscr.addstr(min(base, h - 4), 3, label[: w - 6],
+                      curses.color_pair(C_TODAY if cur == today else C_TEXT)
+                      | curses.A_BOLD)
+        for i, t in enumerate(tasks.get(cur.isoformat(), [])[:3]):
+            line = f"• {t['text']}"
+            stdscr.addstr(min(base + 1 + i, h - 3), 3, line[: w - 6],
+                          curses.color_pair(C_MARK))
+        if not tasks.get(cur.isoformat()):
+            stdscr.addstr(min(base + 1, h - 3), 3, "дел нет",
+                          curses.color_pair(C_MUTED))
+    except curses.error:
+        pass
+
+    hint = "←→↑↓ день · <> месяц · t сегодня · q"
+    try:
+        stdscr.addstr(h - 2, 3, hint[: w - 6], curses.color_pair(C_HINT))
+    except curses.error:
+        pass
+    stdscr.refresh()
+
+
+def tui(stdscr):
+    curses.curs_set(0)
+    try: curses.set_escdelay(25)      # иначе Esc срабатывает через секунду
+    except Exception: pass
+    colors()
+    stdscr.keypad(True)
+    today = date.today()
+    cur = today
+    tasks = load_tasks()
+
+    while True:
+        draw(stdscr, cur, today, tasks)
+        try:
+            ch = key(stdscr.get_wch())
+        except curses.error:
+            continue
+
+        if ch in ("q", "Q", "\x1b", "\n", "\r", curses.KEY_ENTER):
+            break
+        elif ch in ("l", curses.KEY_RIGHT):
+            cur += timedelta(days=1)
+        elif ch in ("h", curses.KEY_LEFT):
+            cur -= timedelta(days=1)
+        elif ch in ("j", curses.KEY_DOWN):
+            cur += timedelta(days=7)
+        elif ch in ("k", curses.KEY_UP):
+            cur -= timedelta(days=7)
+        elif ch in (">", ".", curses.KEY_NPAGE):
+            cur = shift_month(cur, 1)
+        elif ch in ("<", ",", curses.KEY_PPAGE):
+            cur = shift_month(cur, -1)
+        elif ch in ("t", "T", curses.KEY_HOME):
+            cur = today
+        elif ch == "r":
+            tasks = load_tasks()
+
+
+def plain_month():
+    today = date.today()
+    tasks = load_tasks()
+    print(f"  {MONTHS[today.month - 1]} {today.year}")
+    print("  " + " ".join(WEEK))
+    for week in cal.Calendar(firstweekday=0).monthdatescalendar(today.year, today.month):
+        row = []
+        for d in week:
+            s = f"{d.day:>2}" if d.month == today.month else "  "
+            row.append(s)
+        print("  " + " ".join(row))
+
+
+def toggle():
+    """Вторая попытка открыть — закрывает. Если окно на другом столе, зовём его сюда."""
+    import subprocess
+    def hypr(*args):
+        r = subprocess.run(["hyprctl", *args], capture_output=True, text=True)
+        return r.stdout
+
+    try:
+        clients = json.loads(hypr("clients", "-j"))
+        active_ws = json.loads(hypr("activeworkspace", "-j"))["id"]
+    except (ValueError, KeyError):
+        clients, active_ws = [], None
+
+    mine = [c for c in clients if c.get("class") == "calendar-widget"]
+    here = [c for c in mine if c.get("workspace", {}).get("id") == active_ws]
+
+    if here:                                  # открыт на этом столе — закрываем
+        for c in here:
+            hypr("dispatch", "closewindow", f"address:{c['address']}")
+    elif mine:                                # висит на другом столе — перетаскиваем сюда
+        c = mine[0]
+        hypr("dispatch", "movetoworkspace", f"{active_ws},address:{c['address']}")
+        hypr("dispatch", "focuswindow", f"address:{c['address']}")
+    else:
+        subprocess.Popen(["kitty", "--class", "calendar-widget", "-e",
+                          os.path.abspath(__file__)],
+                         start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    if "--toggle" in sys.argv:
+        toggle()
+    elif "--month" in sys.argv:
+        plain_month()
+    elif "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__)
+    else:
+        try:
+            curses.wrapper(tui)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            try:
+                input("Нажми Enter, чтобы закрыть…")
+            except EOFError:
+                pass
+
+
+if __name__ == "__main__":
+    main()

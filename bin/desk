@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# desk — быстрое переключение между Xfce и Hyprland
+#
+#   desk x      → Xfce   (X11)
+#   desk h      → Hyprland (Wayland)
+#   desk        → показать текущую сессию и подсказку
+#
+# Из TTY  — запускает сессию напрямую.
+# Из GUI  — аккуратно разлогинивает, дальше выбор в списке SDDM.
+
+set -euo pipefail
+
+HYPR_EXEC=/usr/bin/start-hyprland   # как в /usr/share/wayland-sessions/hyprland.desktop
+XFCE_EXEC=startxfce4                # как в /usr/share/xsessions/xfce.desktop
+
+say() { printf '%s\n' "$*" >&2; }
+
+current() {
+    if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then echo hyprland
+    elif [ "${XDG_CURRENT_DESKTOP:-}" = "XFCE" ];  then echo xfce
+    elif [ "${XDG_SESSION_TYPE:-tty}" = "tty" ];   then echo tty
+    else echo "${XDG_CURRENT_DESKTOP:-unknown}"
+    fi
+}
+
+usage() {
+    say "текущая сессия: $(current)"
+    say ""
+    say "  desk h    → Hyprland"
+    say "  desk x    → Xfce"
+}
+
+# Разлогин из активной графической сессии; SDDM поднимет экран входа.
+logout_now() {
+    case "$(current)" in
+        hyprland) hyprctl dispatch exit ;;
+        xfce)     xfce4-session-logout --logout ;;
+        *)        loginctl terminate-session "${XDG_SESSION_ID:-$(loginctl show-session self -p Id --value)}" ;;
+    esac
+}
+
+target=${1:-}
+case "$target" in
+    h|hypr|hyprland) want=hyprland ;;
+    x|xfce)          want=xfce ;;
+    ''|-h|--help)    usage; exit 0 ;;
+    *) say "неизвестная сессия: $target"; usage; exit 1 ;;
+esac
+
+now=$(current)
+
+if [ "$now" = "$want" ]; then
+    say "уже в $want — нечего переключать"
+    exit 0
+fi
+
+# Уже есть графическая сессия на другом VT? Тогда вторую не поднимаем.
+other_gui() {
+    loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}' | while read -r s; do
+        [ "$s" = "${XDG_SESSION_ID:-}" ] && continue
+        t=$(loginctl show-session "$s" -p Type --value 2>/dev/null || true)
+        case "$t" in x11|wayland) loginctl show-session "$s" -p VTNr --value; return ;; esac
+    done
+}
+
+if [ "$now" = tty ]; then
+    vt=$(other_gui || true)
+    if [ -n "${vt:-}" ]; then
+        say "уже есть графическая сессия на tty${vt} — переключись туда: Ctrl+Alt+F${vt}"
+        say "и запусти «desk $want» уже оттуда (иначе получишь два рабочих стола сразу)"
+        exit 1
+    fi
+    # Мы на консоли — стартуем нужную сессию прямо отсюда.
+    say "запускаю $want ..."
+    case "$want" in
+        hyprland) exec "$HYPR_EXEC" ;;
+        xfce)     exec "$XFCE_EXEC" ;;
+    esac
+else
+    # Мы внутри графической сессии — выходим, дальше выбор в SDDM.
+    say "выхожу из $now — выбери «$want» в списке сессий SDDM (значок слева на экране входа)"
+    logout_now
+fi

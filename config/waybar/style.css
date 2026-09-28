@@ -1,0 +1,154 @@
+/* Waybar — «парящие островки» в тон фиолетовым обоям (палитра Catppuccin Mocha) */
+
+@define-color base     rgba(31, 30, 31, 0.72);
+@define-color surface  rgba(60, 57, 60, 0.60);
+@define-color text     #e2dfe2;
+@define-color subtext  #b8b6b8;
+@define-color mauve    #c7b3c5;
+@define-color pink     #d7ccd4;
+@define-color blue     #89b4fa;
+@define-color teal     #94e2d5;
+@define-color green    #a6e3a1;
+@define-color yellow   #f9e2af;
+@define-color peach    #fab387;
+@define-color red      #f38ba8;
+
+* {
+  font-family: "JetBrains Mono", "Font Awesome 7 Free Solid", "Font Awesome 7 Free",
+               "Font Awesome 7 Brands Regular", monospace;
+  font-size: 13px;
+  font-weight: 600;
+  border: none;
+  border-radius: 0;
+  min-height: 0;
+}
+
+window#waybar {
+  background: transparent;
+  color: @text;
+}
+
+/* три островка */
+.modules-left, .modules-center, .modules-right {
+  background: @base;
+  border: 1px solid alpha(@mauve, 0.35);
+  border-radius: 14px;
+  padding: 0 6px;
+}
+
+tooltip {
+  background: rgba(31, 30, 31, 0.95);
+  border: 1px solid alpha(@mauve, 0.5);
+  border-radius: 10px;
+}
+tooltip label { color: @text; }
+
+/* рабочие столы */
+#workspaces { margin: 4px 0; }
+#workspaces button {
+  padding: 0 9px;
+  margin: 0 2px;
+  color: @subtext;
+  background: transparent;
+  border-radius: 10px;
+  transition: all 0.25s ease;
+}
+#workspaces button.empty  { color: alpha(@subtext, 0.4); }
+#workspaces button.active {
+  color: #272527;
+  background: linear-gradient(90deg, @mauve, @pink);
+  padding: 0 16px;
+}
+#workspaces button:hover  { background: @surface; color: @text; }
+#workspaces button.urgent { background: @red; color: #272527; }
+
+#window { color: @subtext; padding: 0 10px; font-weight: 500; }
+window#waybar.empty #window { padding: 0; }
+
+#clock { color: @text; padding: 0 12px; }
+
+/* модули справа */
+#custom-wallpaper, #tray, #language, #pulseaudio, #backlight, #network, #bluetooth,
+#custom-cpu, #custom-memory, #temperature, #battery, #custom-power {
+  padding: 0 7px;
+  margin: 5px 1px;
+  border-radius: 10px;
+  background: transparent;
+  transition: background 0.2s ease;
+}
+#custom-wallpaper:hover, #language:hover, #pulseaudio:hover, #backlight:hover, #network:hover, #bluetooth:hover,
+#custom-cpu:hover, #custom-memory:hover, #battery:hover { background: @surface; }
+
+/* GTK при нехватке места сжимает подписи с многоточием — этим двум держим ширину,
+   иначе значок сети и раскладка превращаются в «…» */
+#language { min-width: 42px; }
+#network  { min-width: 52px; }
+
+#custom-wallpaper { color: @pink; }
+#language    { color: @mauve; }
+#pulseaudio  { color: @pink; }
+#backlight   { color: @yellow; }
+#network     { color: @teal; }
+#bluetooth               { color: @blue; }
+#bluetooth.off,
+#bluetooth.disabled,
+#bluetooth.no-controller { color: alpha(@subtext, 0.55); }
+#bluetooth.connected     { color: @green; }
+#custom-cpu    { color: @blue; }
+#custom-memory { color: @mauve; }
+#temperature { color: @peach; }
+#battery     { color: @green; }
+
+#pulseaudio.muted, #network.disconnected { color: alpha(@subtext, 0.6); }
+#battery.charging, #battery.plugged       { color: @green; }
+#battery.warning:not(.charging)           { color: @peach; }
+#battery.critical:not(.charging),
+#temperature.critical {
+  background: @red;
+  color: #272527;
+}
+
+#custom-power {
+  color: @red;
+  margin-right: 2px;
+  padding: 0 12px;
+}
+#custom-power:hover { background: @red; color: #272527; }
+
+/* плеер: появляется рядом с часами, только когда что-то играет */
+#mpris {
+  color: @pink;
+  padding: 0 12px;
+  margin: 5px 0;
+  border-left: 1px solid alpha(@mauve, 0.3);
+}
+#mpris.paused { color: @subtext; }
+
+/* режим экрана и уведомления */
+#custom-nightmode, #custom-notifications {
+  padding: 0 7px;
+  margin: 5px 1px;
+  border-radius: 10px;
+  transition: background 0.2s ease;
+}
+#custom-nightmode:hover, #custom-notifications:hover { background: @surface; }
+#custom-nightmode.off   { color: @subtext; }
+#custom-nightmode.warm  { color: @yellow; }
+#custom-nightmode.night { color: @peach; }
+#custom-nightmode.auto  { color: @mauve; }
+#custom-notifications              { color: @text; }
+#custom-notifications.notification { color: @mauve; }
+#custom-notifications.dnd-none,
+#custom-notifications.dnd-notification { color: @subtext; }
+
+/* VPN */
+#custom-vpn {
+  padding: 0 8px;
+  margin: 5px 1px;
+  border-radius: 10px;
+  transition: background 0.2s ease;
+}
+#custom-vpn:hover { background: @surface; }
+#custom-vpn.disconnected { color: @subtext; }
+#custom-vpn.connected    { background: alpha(@green, 0.15); }
+#custom-vpn.connected    { color: @green; }

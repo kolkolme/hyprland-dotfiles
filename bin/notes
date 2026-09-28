@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""notes — заметки в терминале.
+
+  notes                 открыть список
+  notes new ТЕКСТ       создать заметку из строки, не открывая окно
+  notes quick           спросить текст через wofi и создать
+  notes list            перечислить в stdout
+  notes find СЛОВО      искать по всем заметкам
+  notes last            показать последнюю заметку целиком
+  notes --help          справка
+
+Заметки — обычные файлы .md в ~/.local/share/notes: их видно из любого
+редактора, можно грепать и класть в git. Каталог задаётся переменной
+NOTES_DIR. Цвета берутся из палитры терминала, поэтому wallpick
+перекрашивает заметки вместе со всей системой.
+"""
+import curses, locale, os, re, shutil, subprocess, sys, termios, textwrap
+from datetime import datetime
+from pathlib import Path
+
+locale.setlocale(locale.LC_ALL, "")
+
+DIR = Path(os.path.expanduser(os.environ.get("NOTES_DIR", "~/.local/share/notes")))
+TRASH = DIR / ".trash"
+MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн",
+          "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+RU2EN = str.maketrans(
+    "йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,",
+    "qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?")
+
+
+def key(ch):
+    """Клавиши читаются по расположению: «ф» там же, где «a»."""
+    if isinstance(ch, str) and ch and ("а" <= ch.lower() <= "я" or ch.lower() == "ё"):
+        return ch.translate(RU2EN)
+    return ch
+
+
+# ─────────────────────────────── файлы ───────────────────────────────────
+
+def slug(text, limit=40):
+    s = re.sub(r"[^\w\s-]", "", text, flags=re.U).strip().lower()
+    s = re.sub(r"[\s_]+", "-", s)
+    return (s[:limit] or "заметка").strip("-")
+
+
+def notes_all(flt=""):
+    """Список заметок: свежие сверху. Поиск идёт и по заголовку, и по тексту."""
+    DIR.mkdir(parents=True, exist_ok=True)
+    out = []
+    for p in DIR.glob("*.md"):
+        try:
+            body = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if flt and flt.lower() not in body.lower() and flt.lower() not in p.name.lower():
+            continue
+        out.append((p, body))
+    out.sort(key=lambda x: x[0].stat().st_mtime, reverse=True)
+    return out
+
+
+def title_of(body, path):
+    for line in body.split("\n"):
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return line
+    return path.stem
+
+
+def when(path):
+    d = datetime.fromtimestamp(path.stat().st_mtime)
+    today = datetime.now()
+    if d.date() == today.date():
+        return d.strftime("%H:%M")
+    if d.year == today.year:
+        return f"{d.day} {MONTHS[d.month - 1]}"
+    return d.strftime("%d.%m.%y")
+
+
+def create(text=""):
+    DIR.mkdir(parents=True, exist_ok=True)
+    head = (text.strip().split("\n")[0] if text.strip() else "Без названия")
+    name = f"{datetime.now():%Y%m%d-%H%M%S}-{slug(head)}.md"
+    p = DIR / name
+    p.write_text(text if text.strip() else "", encoding="utf-8")
+    return p
+
+
+def to_trash(p):
+    TRASH.mkdir(parents=True, exist_ok=True)
+    dst = TRASH / f"{datetime.now():%Y%m%d-%H%M%S}-{p.name}"
+    shutil.move(str(p), str(dst))
+    return dst
+
+
+def from_trash():
+    if not TRASH.is_dir():
+        return None
+    items = sorted(TRASH.glob("*.md"), key=lambda x: x.stat().st_mtime)
+    if not items:
+        return None
+    src = items[-1]
+    dst = DIR / re.sub(r"^\d{8}-\d{6}-", "", src.name)
+    shutil.move(str(src), str(dst))
+    return dst
+
+
+# ─────────────────────────────── цвета ───────────────────────────────────
+
+C_FRAME, C_TEXT, C_MUTED, C_SEL, C_TITLE, C_MARK, C_HINT, C_EDIT = range(1, 9)
+
+
+def free_keys():
+    """Отдать приложению Ctrl+S и убрать паузу после Esc.
+
+    ⚠️ По умолчанию терминал перехватывает Ctrl+S под остановку вывода (IXON) —
+    до программы он просто не доходит. А одиночный Esc curses ждёт целую
+    секунду, проверяя, не начало ли это escape-последовательности."""
+    try:
+        a = termios.tcgetattr(0)
+        a[0] &= ~(termios.IXON | termios.IXOFF)
+        termios.tcsetattr(0, termios.TCSANOW, a)
+    except Exception:
+        pass
+    try:
+        curses.set_escdelay(25)
+    except Exception:
+        pass
+
+
+def colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_FRAME, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_TEXT, -1, -1)
+    curses.init_pair(C_MUTED, 8, -1)
+    curses.init_pair(C_SEL, curses.COLOR_BLACK, curses.COLOR_MAGENTA)
+    curses.init_pair(C_TITLE, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_MARK, curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_HINT, 8, -1)
+    curses.init_pair(C_EDIT, curses.COLOR_GREEN, -1)
+
+
+def put(win, y, x, text, attr=0, width=None):
+    """Безопасный вывод: не падаем на краю окна и не пишем за границу."""
+    h, w = win.getmaxyx()
+    if not (0 <= y < h) or x >= w:
+        return
+    room = (w - x - 1) if width is None else min(width, w - x - 1)
+    if room <= 0:
+        return
+    try:
+        win.addstr(y, x, text[:room], attr)
+    except curses.error:
+        pass
+
+
+def prompt(win, label, initial=""):
+    """Однострочный ввод в нижней рамке. Enter — принять, Esc — отменить."""
+    h, w = win.getmaxyx()
+    buf = list(initial)
+    curses.curs_set(1)
+    try:
+        while True:
+            line = label + "".join(buf)
+            win.move(h - 2, 1)
+            win.clrtoeol()
+            put(win, h - 2, 2, line[-(w - 5):], curses.color_pair(C_TEXT))
+            put(win, h - 2, w - 1, "│", curses.color_pair(C_FRAME))
+            win.refresh()
+            try:
+                ch = win.get_wch()
+            except curses.error:
+                continue
+            if ch in ("\n", "\r", curses.KEY_ENTER, 10, 13):
+                return "".join(buf).strip()
+            if ch == "\x1b":
+                return None
+            if ch in ("\x7f", "\b", curses.KEY_BACKSPACE, 263):
+                if buf:
+                    buf.pop()
+            elif isinstance(ch, str) and ch.isprintable():
+                buf.append(ch)
+    finally:
+        curses.curs_set(0)
+
+
+# ───────────────────────── встроенный редактор ───────────────────────────
+
+def wrap_lines(lines, width):
+    """Мягкий перенос для показа. Возвращает [(индекс строки, сдвиг, кусок)]."""
+    out = []
+    for i, line in enumerate(lines):
+        if not line:
+            out.append((i, 0, ""))
+            continue
+        start = 0
+        for piece in textwrap.wrap(line, width, drop_whitespace=False,
+                                   break_long_words=True) or [""]:
+            out.append((i, start, piece))
+            start += len(piece)
+    return out
+
+
+def editor(stdscr, path, at_end=False):
+    """Правка заметки прямо здесь: Ctrl+S — сохранить, Esc — выйти."""
+    lines = path.read_text(encoding="utf-8").split("\n") if path.exists() else [""]
+    if not lines:
+        lines = [""]
+    # ⚠️ У новой заметки курсор ставим в конец: иначе первый же набранный
+    # символ влезает ПЕРЕД заголовком и заголовком становится он.
+    cy = (len(lines) - 1) if at_end else 0
+    cx = len(lines[cy]) if at_end else 0
+    top, dirty = 0, False
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        width = max(20, w - 6)
+        stdscr.erase()
+        stdscr.attrset(curses.color_pair(C_FRAME))
+        stdscr.box()
+        head = f" ПРАВКА · {path.name} "
+        put(stdscr, 0, 2, head, curses.color_pair(C_FRAME) | curses.A_BOLD)
+        if dirty:
+            mark = " не сохранено "
+            put(stdscr, 0, max(3, w - len(mark) - 3), mark, curses.color_pair(C_MARK))
+
+        view = wrap_lines(lines, width)
+        # где курсор в развёрнутом виде
+        crow = 0
+        for n, (li, off, piece) in enumerate(view):
+            if li == cy and off <= cx <= off + len(piece):
+                crow = n
+                break
+        body_h = h - 4
+        if crow < top:
+            top = crow
+        if crow >= top + body_h:
+            top = crow - body_h + 1
+
+        for n, (li, off, piece) in enumerate(view[top:top + body_h]):
+            attr = curses.color_pair(C_TITLE) | curses.A_BOLD if lines[li].startswith("#") \
+                else curses.color_pair(C_TEXT)
+            put(stdscr, 2 + n, 3, piece, attr)
+
+        put(stdscr, h - 2, 3,
+            "Ctrl+S или F2 сохранить · Esc выйти · строк %d" % len(lines),
+            curses.color_pair(C_HINT))
+        # ставим курсор
+        vis = view[top:top + body_h]
+        for n, (li, off, piece) in enumerate(vis):
+            if li == cy and off <= cx <= off + len(piece):
+                try:
+                    stdscr.move(2 + n, 3 + (cx - off))
+                except curses.error:
+                    pass
+                break
+        curses.curs_set(1)
+        stdscr.refresh()
+
+        try:
+            ch = stdscr.get_wch()
+        except curses.error:
+            continue
+
+        if ch in ("\x13", curses.KEY_F2):                 # Ctrl+S или F2
+            path.write_text("\n".join(lines), encoding="utf-8")
+            dirty = False
+        elif ch == "\x1b":
+            if dirty:
+                curses.curs_set(0)
+                a = prompt(stdscr, "Сохранить изменения? д/н: ")
+                if (a or "").strip().lower() in ("y", "yes", "д", "да", ""):
+                    path.write_text("\n".join(lines), encoding="utf-8")
+            curses.curs_set(0)
+            return
+        elif ch == curses.KEY_UP:
+            cy = max(0, cy - 1); cx = min(cx, len(lines[cy]))
+        elif ch == curses.KEY_DOWN:
+            cy = min(len(lines) - 1, cy + 1); cx = min(cx, len(lines[cy]))
+        elif ch == curses.KEY_LEFT:
+            if cx: cx -= 1
+            elif cy: cy -= 1; cx = len(lines[cy])
+        elif ch == curses.KEY_RIGHT:
+            if cx < len(lines[cy]): cx += 1
+            elif cy < len(lines) - 1: cy += 1; cx = 0
+        elif ch == curses.KEY_HOME:
+            cx = 0
+        elif ch == curses.KEY_END:
+            cx = len(lines[cy])
+        elif ch in ("\n", "\r", curses.KEY_ENTER, 10, 13):
+            rest = lines[cy][cx:]
+            lines[cy] = lines[cy][:cx]
+            lines.insert(cy + 1, rest)
+            cy += 1; cx = 0; dirty = True
+        elif ch in ("\x7f", "\b", curses.KEY_BACKSPACE, 263):
+            if cx:
+                lines[cy] = lines[cy][:cx - 1] + lines[cy][cx:]
+                cx -= 1; dirty = True
+            elif cy:
+                cx = len(lines[cy - 1])
+                lines[cy - 1] += lines[cy]
+                del lines[cy]; cy -= 1; dirty = True
+        elif ch == curses.KEY_DC:
+            if cx < len(lines[cy]):
+                lines[cy] = lines[cy][:cx] + lines[cy][cx + 1:]; dirty = True
+            elif cy < len(lines) - 1:
+                lines[cy] += lines[cy + 1]; del lines[cy + 1]; dirty = True
+        elif isinstance(ch, str) and (ch.isprintable() or ch == "\t"):
+            ins = "    " if ch == "\t" else ch
+            lines[cy] = lines[cy][:cx] + ins + lines[cy][cx:]
+            cx += len(ins); dirty = True
+
+
+# ──────────────────────────── список и просмотр ──────────────────────────
+
+HELP = [
+    ("↓ ↑  j k", "по списку"),
+    ("Enter  e", "открыть на правку"),
+    ("a   Ins", "новая заметка"),
+    ("n", "новая из одной строки"),
+    ("d   Del", "убрать в корзину · u вернуть"),
+    ("/", "поиск по тексту всех заметок"),
+    ("J K", "листать текст справа"),
+    ("?", "эта справка · q выход"),
+    ("", ""),
+    ("раскладка", "любая: ф=a, в=d, у=e"),
+]
+
+
+def draw_help(stdscr):
+    h, w = stdscr.getmaxyx()
+    bw = min(52, max(24, w - 4))
+    rows = min(len(HELP), max(1, h - 5))
+    bh = min(rows + 4, h)
+    box = stdscr.derwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
+    box.erase(); box.attrset(curses.color_pair(C_FRAME)); box.box()
+    put(box, 0, 2, " КЛАВИШИ ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+    for i, (k, v) in enumerate(HELP[:rows], start=2):
+        if i >= bh - 1:
+            break
+        put(box, i, 3, f"{k:<11}", curses.color_pair(C_MARK))
+        put(box, i, 15, v, curses.color_pair(C_MUTED))
+    box.refresh()
+    stdscr.get_wch()
+
+
+def tui(stdscr):
+    curses.curs_set(0)
+    colors()
+    free_keys()
+    stdscr.keypad(True)
+    sel, flt, scroll, msg = 0, "", 0, ""
+
+    while True:
+        items = notes_all(flt)
+        sel = max(0, min(sel, len(items) - 1))
+        h, w = stdscr.getmaxyx()
+        left = max(24, int(w * 0.38))
+
+        stdscr.erase()
+        stdscr.attrset(curses.color_pair(C_FRAME))
+        stdscr.box()
+        put(stdscr, 0, 2, " ЗАМЕТКИ ", curses.color_pair(C_FRAME) | curses.A_BOLD)
+        counter = f" {len(items)} " if not flt else f" найдено {len(items)} по «{flt}» "
+        put(stdscr, 0, max(3, w - len(counter) - 3), counter, curses.color_pair(C_MUTED))
+        for y in range(2, h - 2):                       # разделитель колонок
+            put(stdscr, y, left, "│", curses.color_pair(C_FRAME))
+
+        if not items:
+            empty = "ничего не нашлось" if flt else "пока пусто — «a» создаёт заметку"
+            put(stdscr, h // 2, 3, empty, curses.color_pair(C_MUTED))
+        body_h = h - 4
+        top = max(0, sel - body_h + 2) if sel >= body_h else 0
+        for i, (p, body) in enumerate(items[top:top + body_h]):
+            y = 2 + i
+            is_sel = (top + i) == sel
+            stamp = when(p)
+            name = title_of(body, p)
+            put(stdscr, y, 2, "▸" if is_sel else " ", curses.color_pair(C_SEL) | curses.A_BOLD)
+            attr = curses.color_pair(C_TEXT) | (curses.A_BOLD if is_sel else 0)
+            put(stdscr, y, 4, name, attr, width=left - 6 - len(stamp))
+            put(stdscr, y, left - len(stamp) - 1, stamp, curses.color_pair(C_MUTED))
+
+        if items:
+            p, body = items[sel]
+            lines = body.split("\n")
+            wrapped = []
+            for ln in lines:
+                wrapped += textwrap.wrap(ln, max(10, w - left - 5)) or [""]
+            scroll = max(0, min(scroll, max(0, len(wrapped) - body_h)))
+            for i, ln in enumerate(wrapped[scroll:scroll + body_h]):
+                src = ln.strip()
+                if src.startswith("#"):
+                    a = curses.color_pair(C_TITLE) | curses.A_BOLD
+                elif src.startswith(("- ", "* ", "• ")):
+                    a = curses.color_pair(C_TEXT)
+                elif src.startswith(("```", "    ")):
+                    a = curses.color_pair(C_MUTED)
+                else:
+                    a = curses.color_pair(C_TEXT)
+                put(stdscr, 2 + i, left + 2, ln.lstrip("#").strip() if src.startswith("#") else ln, a)
+            if not body.strip():
+                put(stdscr, 2, left + 2, "заметка пустая — нажми Enter и пиши",
+                    curses.color_pair(C_MUTED))
+
+        hint = msg or "a новая · Enter правка · / поиск · d убрать · ? клавиши"
+        put(stdscr, h - 2, 3, hint, curses.color_pair(C_MARK if msg else C_HINT))
+        stdscr.refresh()
+        msg = ""
+
+        try:
+            ch = key(stdscr.get_wch())
+        except curses.error:
+            continue
+        cur = items[sel][0] if items else None
+
+        if ch in ("q", "Q", "\x1b"):
+            break
+        elif ch in ("j", curses.KEY_DOWN):
+            sel = min(sel + 1, len(items) - 1); scroll = 0
+        elif ch in ("k", curses.KEY_UP):
+            sel = max(sel - 1, 0); scroll = 0
+        elif ch == "J":
+            scroll += 3
+        elif ch == "K":
+            scroll = max(0, scroll - 3)
+        elif ch in ("g", curses.KEY_HOME):
+            sel = 0; scroll = 0
+        elif ch in ("G", curses.KEY_END):
+            sel = len(items) - 1; scroll = 0
+        elif ch in ("a", curses.KEY_IC):
+            t = prompt(stdscr, "заголовок новой заметки: ")
+            if t:
+                p = create(f"# {t}\n\n")
+                editor(stdscr, p, at_end=True)
+                sel = 0; msg = "создано"
+        elif ch == "n":
+            t = prompt(stdscr, "заметка одной строкой: ")
+            if t:
+                create(t + "\n")
+                sel = 0; msg = "записано"
+        elif ch in ("e", "\n", "\r", curses.KEY_ENTER) and cur:
+            editor(stdscr, cur)
+        elif ch in ("d", curses.KEY_DC) and cur:
+            to_trash(cur)
+            msg = "убрано · «u» вернуть"
+        elif ch == "u":
+            back = from_trash()
+            msg = f"вернул: {back.name}" if back else "корзина пуста"
+        elif ch in ("/", "."):          # в русской раскладке эта клавиша даёт точку
+            flt = prompt(stdscr, "поиск: ", flt) or ""
+            sel = 0; scroll = 0
+        elif ch in ("?", ","):          # Shift над той же клавишей — запятая
+            draw_help(stdscr)
+
+
+# ─────────────────────────────── CLI ─────────────────────────────────────
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        try:
+            curses.wrapper(tui)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print("\nЗаметки целы:", DIR)
+            try: input("Enter, чтобы закрыть…")
+            except EOFError: pass
+            sys.exit(1)
+    elif a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+    elif a[0] == "new" and len(a) > 1:
+        p = create(" ".join(a[1:]) + "\n")
+        print(f"создано: {p}")
+    elif a[0] == "quick":
+        style = os.path.expanduser("~/.config/wofi/style.css")
+        cmd = ["wofi", "--dmenu", "--prompt", "Заметка", "--width", "620",
+               "--height", "60", "--lines", "0", "--cache-file", "/dev/null"]
+        if os.path.exists(style):
+            cmd += ["--style", style]
+        r = subprocess.run(cmd, input="", capture_output=True, text=True)
+        text = r.stdout.strip()
+        if text:
+            p = create(text + "\n")
+            subprocess.run(["notify-send", "-a", "Заметки", "-i", "accessories-text-editor",
+                            "Заметка сохранена", text[:60]], stderr=subprocess.DEVNULL)
+    elif a[0] == "list":
+        for p, body in notes_all():
+            print(f"{when(p):>8}  {title_of(body, p)}")
+    elif a[0] == "find" and len(a) > 1:
+        q = " ".join(a[1:]).lower()
+        for p, body in notes_all(q):
+            print(f"\n\033[35m{title_of(body, p)}\033[0m  ({when(p)})")
+            for ln in body.split("\n"):
+                if q in ln.lower():
+                    print("   " + ln.strip()[:100])
+    elif a[0] == "last":
+        items = notes_all()
+        if items:
+            print(items[0][1])
+    else:
+        print(__doc__, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

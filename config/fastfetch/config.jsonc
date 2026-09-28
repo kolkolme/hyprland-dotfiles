@@ -1,0 +1,16 @@
+{
+  "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+  "logo": { "type": "file-raw", "source": "~/.config/fastfetch/arch-rainbow.txt", "padding": { "top": 0, "right": 3 } },
+  "display": { "separator": "  ", "color": { "keys": "magenta" } },
+  "modules": [
+    { "type": "title", "color": { "user": "magenta", "at": "white", "host": "magenta" } },
+    { "type": "os",       "key": "󰈸 " },
+    { "type": "kernel",   "key": " " },
+    { "type": "wm",       "key": " " },
+    { "type": "uptime",   "key": "󰅐 " },
+    { "type": "memory",   "key": "󰍛 " },
+    { "type": "battery",  "key": "󰁹 " },
+    "break",
+    { "type": "colors", "symbol": "circle" }
+  ]
+}
