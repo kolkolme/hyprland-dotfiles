@@ -67,13 +67,25 @@ fi
 # Без включённого менеджера входа такого сеанса нет, и в Hyprland
 # не работают ни мышь, ни клавиатура.
 say "Настраиваю вход в систему"
-if systemctl list-unit-files sddm.service >/dev/null 2>&1; then
+# Если менеджер входа уже настроен (в Kali часто lightdm) — не трогаем его:
+# два включённых менеджера дерутся за экран. Нам важно лишь, чтобы
+# хоть какой-то был включён, иначе не будет сеанса logind.
+DM_LINK=/etc/systemd/system/display-manager.service
+CUR_DM=""
+# именно -e, а не readlink: для несуществующего пути readlink -f
+# возвращает сам путь, и basename дал бы мнимое имя службы
+[ -e "$DM_LINK" ] && CUR_DM="$(basename "$(readlink -f "$DM_LINK")" .service)"
+if [ -n "$CUR_DM" ]; then
+    sudo systemctl enable "$CUR_DM" >/dev/null 2>&1 \
+        && ok "менеджер входа уже настроен ($CUR_DM), включил его"
+elif systemctl list-unit-files sddm.service >/dev/null 2>&1; then
     sudo systemctl enable sddm >/dev/null 2>&1 && ok "sddm включён при загрузке"
-    sudo systemctl set-default graphical.target >/dev/null 2>&1 \
-        && ok "система будет грузиться в графику"
 else
-    warn "sddm не установлен — входить придётся из консоли"
+    warn "менеджера входа нет — Hyprland придётся запускать из консоли,"
+    warn "и тогда мышь с клавиатурой могут не заработать"
 fi
+sudo systemctl set-default graphical.target >/dev/null 2>&1 \
+    && ok "система будет грузиться в графику"
 
 # Запасной путь: если сеанс logind почему-то не поднимется, прямой доступ
 # к устройствам даёт членство в группах.
