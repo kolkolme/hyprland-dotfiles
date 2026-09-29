@@ -5,8 +5,7 @@
 
 ## Установка
 
-Нужна свежеустановленная **Kali Linux** (подойдёт и другой Debian-based
-дистрибутив, но проверялось на Kali 2026.2).
+Работает на **Kali Linux** и на **Debian 13 (trixie)**.
 
 ```bash
 git clone <адрес-репозитория> ~/dotfiles
@@ -31,6 +30,7 @@ cd ~/dotfiles
 | `icons/` | тема курсора → `~/.local/share/icons` |
 | `packages.txt` | 64 пакета, которые ставит установщик |
 | `apps.sh` | прикладные программы: C++, VS Code, Steam, Telegram, Discord |
+| `security-tools.sh` | инструменты безопасности из набора Kali |
 
 ### Рабочий стол
 
@@ -89,6 +89,50 @@ Firefox, отцепленные от терминала), `vpn`, `wifi`.
 - `lock` / `lock-kbd` — блокировка экрана
 - `desk` — переключение между Xfce и Hyprland
 - `games`, `steam-quit` — игрушки для терминала и корректный выход из Steam
+
+## Debian
+
+Установщик сам определяет дистрибутив и подстраивается.
+
+Из 64 пакетов **57 есть в trixie напрямую**, а весь Hyprland (`hyprland`,
+`hypridle`, `hyprlock`, `hyprpaper`, `hyprsunset`, `xdg-desktop-portal-hyprland`)
+лежит только в **backports** — скрипт подключает их сам.
+
+Версии сходятся: backports даёт Hyprland 0.55.2, а синтаксис `windowrule`
+с префиксом `match:` появился ещё в 0.53, так что конфиг работает без правок.
+Остальные компоненты в Debian и Kali одной версии.
+
+Что нужно от тебя: в `/etc/apt/sources.list` должны быть **contrib** и
+**non-free**, иначе не поставится Steam и часть прошивок. Скрипт предупредит.
+
+`fonts-nerd-symbols` в стабильном Debian нет — он пропускается, значки в
+Waybar берутся из `fonts-font-awesome`.
+
+## Инструменты безопасности (`security-tools.sh`)
+
+Набор в духе Kali: nmap, wireshark, metasploit, sqlmap, hashcat, hydra,
+john, aircrack-ng, SecLists и прочее. Установщик спрашивает отдельно —
+весит несколько гигабайт.
+
+**На Kali** всё берётся из репозиториев.
+
+**На Debian** 19 инструментов есть в репозиториях, а 10 нет. Они ставятся
+из официальных источников самих разработчиков:
+
+| Инструмент | Откуда |
+|---|---|
+| metasploit-framework | официальный установщик Rapid7 |
+| netexec, theHarvester | pipx с GitHub |
+| responder, nikto, enum4linux | git clone в `~/.local/opt` |
+| exploitdb (searchsploit) | git clone с GitLab |
+| wpscan | ruby gem |
+| SecLists | git clone, около 1 ГБ |
+| Burp Suite | вручную — у PortSwigger лицензия в установщике |
+
+**Репозитории Kali к Debian не подключаются.** Kali собрана на базе
+Debian testing/sid, и подключение её репозиториев к обычному Debian ломает
+систему — об этом предупреждает и сама команда Kali. Поэтому только
+официальные источники.
 
 ## Прикладные программы (`apps.sh`)
 

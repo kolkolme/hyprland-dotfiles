@@ -74,7 +74,7 @@ nwg-look
 curl
 unzip
 unrar-free
-p7zip-full
+7zip
 
 # --- игрушки для терминала (алиасы bonsai/matrix/pipes/clock) ---
 cbonsai

@@ -24,6 +24,27 @@ read -rp $'\nПродолжить? [y/N] ' a; [[ "$a" =~ ^[Yy]$ ]] || exit 0
 # ---------------------------------------------------------------- пакеты
 say "Ставлю пакеты"
 
+# ---- какой это дистрибутив ----
+. /etc/os-release 2>/dev/null || true
+DISTRO="${ID:-unknown}"
+CODENAME="${VERSION_CODENAME:-}"
+ok "дистрибутив: ${PRETTY_NAME:-$DISTRO}"
+
+if [ "$DISTRO" = "debian" ]; then
+    # В Debian весь Hyprland лежит не в main, а в backports.
+    # Без них install провалится на шести пакетах сразу.
+    if [ -n "$CODENAME" ] && ! grep -rq "$CODENAME-backports" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+        echo "deb http://deb.debian.org/debian $CODENAME-backports main contrib non-free" \
+            | sudo tee /etc/apt/sources.list.d/backports.list >/dev/null
+        ok "подключил $CODENAME-backports (там лежит Hyprland)"
+    fi
+    # Steam и часть прошивок живут в contrib/non-free
+    if ! grep -rqE '^[^#]*\bnon-free\b' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+        warn "в репозиториях нет contrib/non-free — Steam и часть прошивок не поставятся"
+        warn "добавь их в /etc/apt/sources.list и запусти скрипт заново"
+    fi
+fi
+
 # Пароль спрашиваем один раз, заранее и явно. Иначе sudo спросит его
 # посреди установки, и если вывод куда-то перенаправлен — запрос не видно,
 # и всё выглядит как зависший скрипт.
@@ -37,7 +58,31 @@ export NEEDRESTART_MODE=a
 # sddm спрашивает, какой менеджер входа сделать основным — отвечаем заранее
 echo "sddm shared/default-x-display-manager select sddm" | sudo debconf-set-selections 2>/dev/null || true
 
-mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "$SRC/packages.txt")
+mapfile -t ALL_PKGS < <(grep -vE '^\s*(#|$)' "$SRC/packages.txt")
+# Отсеиваем то, чего в этих репозиториях нет: иначе один отсутствующий
+# пакет роняет всю групповую установку в медленный поштучный режим.
+# При set -o pipefail конструкция `cmd | grep -q` ложно падает:
+# grep -q закрывает канал по первому совпадению, cmd получает SIGPIPE,
+# и весь конвейер считается упавшим, хотя совпадение было.
+# Поэтому нигде ниже не используем grep -q в конвейере.
+pkg_available() {
+    local out
+    out="$(apt-cache policy "$1" 2>/dev/null)" || return 1
+    case "$out" in
+        *"Candidate: (none)"*) return 1 ;;
+        *Candidate:*)          return 0 ;;
+        *)                     return 1 ;;
+    esac
+}
+PKGS=(); SKIPPED=()
+for p in "${ALL_PKGS[@]}"; do
+    if pkg_available "$p"; then
+        PKGS+=("$p")
+    else
+        SKIPPED+=("$p")
+    fi
+done
+[ ${#SKIPPED[@]} -gt 0 ] && warn "нет в репозиториях, пропускаю: ${SKIPPED[*]}"
 LOG="$BACKUP/apt.log"; mkdir -p "$BACKUP"
 sudo -E apt-get update 2>&1 | tail -2
 
@@ -45,6 +90,14 @@ sudo -E apt-get update 2>&1 | tail -2
 # сам разрулит зависимости. Если упадёт, разбираем по одному.
 MISSING=()
 echo "   Пакетов к установке: ${#PKGS[@]}. Полный лог: $LOG"
+if [ "$DISTRO" = "debian" ] && [ -n "$CODENAME" ]; then
+    # эти шесть в main отсутствуют — просим apt взять их из backports
+    echo "   Debian: ставлю Hyprland из $CODENAME-backports"
+    sudo -E apt-get install -y -t "$CODENAME-backports" \
+        hyprland hypridle hyprlock hyprpaper hyprsunset xdg-desktop-portal-hyprland \
+        2>&1 | tee -a "$LOG" || warn "часть пакетов Hyprland не встала, смотри $LOG"
+fi
+
 echo "   Это несколько минут. Ниже идёт вывод apt — так видно, что работа идёт."
 if sudo -E apt-get install -y "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
     ok "все ${#PKGS[@]} пакетов"
@@ -91,7 +144,7 @@ sudo systemctl set-default graphical.target >/dev/null 2>&1 \
 # к устройствам даёт членство в группах.
 for g in input video render; do
     getent group "$g" >/dev/null 2>&1 || continue
-    id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$g" && continue
+    case " $(id -nG "$USER" 2>/dev/null) " in *" $g "*) continue ;; esac
     sudo usermod -aG "$g" "$USER" && ok "добавил тебя в группу $g"
 done
 
@@ -156,14 +209,15 @@ mkdir -p "$HOME/.local/share/notes" "$HOME/.local/share/english"
 ok "заметки, задачи, english — пустые, это твои, не чужие"
 
 # ---------------------------------------------------------------- PATH
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
+case ":$PATH:" in *":$HOME/.local/bin:"*) : ;; *)
     say "Добавляю ~/.local/bin в PATH"
     for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
         [ -f "$rc" ] || continue
         grep -q '\.local/bin' "$rc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
         ok "$(basename "$rc")"
     done
-fi
+    ;;
+esac
 
 fc-cache -f >/dev/null 2>&1 || true
 
@@ -172,6 +226,19 @@ if [ -x "$SRC/apps.sh" ]; then
     "$SRC/apps.sh"
 else
     warn "apps.sh не найден — прикладные программы пропущены"
+fi
+
+# ------------------------------------------------- инструменты безопасности
+if [ -x "$SRC/security-tools.sh" ]; then
+    say "Инструменты безопасности из набора Kali"
+    echo "   nmap, wireshark, metasploit, sqlmap, hashcat, SecLists и прочее."
+    echo "   Займёт несколько гигабайт (одни словари SecLists около 1 ГБ)."
+    read -rp "   Поставить? [y/N] " st
+    if [[ "$st" =~ ^[Yy]$ ]]; then
+        "$SRC/security-tools.sh"
+    else
+        ok "пропускаю — поставить потом можно так: ./security-tools.sh"
+    fi
 fi
 
 # ---------------------------------------------------------------- итог

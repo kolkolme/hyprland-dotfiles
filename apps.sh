@@ -76,10 +76,11 @@ if command -v steam >/dev/null 2>&1; then
     ok "уже стоит"
 else
     # Steam 32-битный, без архитектуры i386 не поставится
-    dpkg --print-foreign-architectures | grep -qx i386 || {
+    case " $(dpkg --print-foreign-architectures 2>/dev/null) " in *" i386 "*) : ;; *)
         need_sudo && sudo dpkg --add-architecture i386 && ok "включил архитектуру i386"
         need_sudo && sudo -E apt-get update 2>&1 | tail -2 | tee -a "$LOG"
-    }
+        ;;
+    esac
     grep -rqi 'non-free' /etc/apt/sources.list.d/ /etc/apt/sources.list 2>/dev/null \
         || warn "в репозиториях нет non-free — Steam может не найтись"
     # Steam показывает лицензию и ждёт согласия — отвечаем заранее,
