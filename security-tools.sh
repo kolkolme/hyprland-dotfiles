@@ -63,13 +63,14 @@ say "Дистрибутив: ${PRETTY_NAME:-$DISTRO}"
 
 # ─────────────────────────────── что есть в обоих дистрибутивах
 say "Инструменты из репозиториев"
+# dnsutils переименован в bind9-dnsutils; недоступные имена apt_some отсеет сам
 apt_some nmap wireshark tcpdump aircrack-ng hydra john hashcat sqlmap \
          binwalk foremost gobuster dirb wfuzz ffuf masscan recon-ng \
-         netcat-openbsd socat smbclient whois dnsutils
+         netcat-openbsd socat smbclient whois bind9-dnsutils dnsutils nikto
 
 if [ "$DISTRO" = "kali" ]; then
     say "Kali: остальное тоже в репозиториях"
-    apt_some metasploit-framework burpsuite netexec responder nikto \
+    apt_some metasploit-framework burpsuite netexec responder \
              seclists exploitdb wpscan enum4linux theharvester
     say "Готово"
     exit 0
@@ -94,7 +95,6 @@ done
 
 say "Инструменты с GitHub"
 git_tool responder   https://github.com/lgandx/Responder            Responder.py
-git_tool nikto       https://github.com/sullo/nikto                 program/nikto.pl
 git_tool enum4linux  https://github.com/CiscoCXSecurity/enum4linux  enum4linux.pl
 
 say "exploitdb (searchsploit)"
@@ -132,11 +132,19 @@ say "Burp Suite"
 warn "ставится вручную: у PortSwigger лицензионное соглашение в установщике"
 echo "     https://portswigger.net/burp/communitydownload"
 
-say "Готово"
+say "Проверяю инструменты"
+for c in nmap sqlmap hydra john hashcat aircrack-ng; do
+    command -v "$c" >/dev/null 2>&1 && ok "$c" \
+        || { printf '\033[1;31m  ✗\033[0m %s\n' "$c"; FAILED+=("$c"); }
+done
+
 if [ ${#FAILED[@]} -gt 0 ]; then
-    warn "не установились: ${FAILED[*]}"
+    echo
+    warn "НЕ УСТАНОВИЛИСЬ: ${FAILED[*]}"
     echo "     Подробности: $LOG. Повторный запуск пропустит готовое."
+    exit 1
 fi
+say "Инструменты: базовый набор на месте"
 echo
-echo "   Команды из ~/.local/bin: responder, nikto, enum4linux, searchsploit"
+echo "   Команды из ~/.local/bin: responder, enum4linux, searchsploit"
 echo "   Словари SecLists: ~/.local/share/seclists"

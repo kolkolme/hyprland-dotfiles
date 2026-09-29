@@ -48,8 +48,18 @@ fi
 # Пароль спрашиваем один раз, заранее и явно. Иначе sudo спросит его
 # посреди установки, и если вывод куда-то перенаправлен — запрос не видно,
 # и всё выглядит как зависший скрипт.
-echo "   Сейчас потребуется пароль sudo (один раз на всю установку)."
-sudo -v || { echo "Без sudo установить пакеты нельзя."; exit 1; }
+# sudo -v не годится как проверка: он всегда пытается обновить метку
+# времени и, если хоть одно правило требует пароль, просит терминал —
+# даже когда обычный sudo прекрасно работает без него.
+need_sudo() {
+    sudo -n true 2>/dev/null && return 0
+    echo "   Нужен пароль sudo:"
+    sudo -v
+}
+if ! need_sudo; then
+    warn "не удалось получить sudo заранее"
+    warn "пароль спросят при первой же команде, требующей root"
+fi
 
 # Ни один пакет не должен открыть диалог и ждать ответа в тишине.
 export DEBIAN_FRONTEND=noninteractive
@@ -57,6 +67,13 @@ export NEEDRESTART_MODE=a
 
 # sddm спрашивает, какой менеджер входа сделать основным — отвечаем заранее
 echo "sddm shared/default-x-display-manager select sddm" | sudo debconf-set-selections 2>/dev/null || true
+
+LOG="$BACKUP/apt.log"; mkdir -p "$BACKUP"
+
+# Индексы обновляем ДО отбора пакетов: backports подключили только что,
+# и без update отбор посчитал бы весь Hyprland несуществующим.
+echo "   Обновляю списки пакетов..."
+sudo -E apt-get update 2>&1 | tail -2
 
 mapfile -t ALL_PKGS < <(grep -vE '^\s*(#|$)' "$SRC/packages.txt")
 # Отсеиваем то, чего в этих репозиториях нет: иначе один отсутствующий
@@ -83,30 +100,30 @@ for p in "${ALL_PKGS[@]}"; do
     fi
 done
 [ ${#SKIPPED[@]} -gt 0 ] && warn "нет в репозиториях, пропускаю: ${SKIPPED[*]}"
-LOG="$BACKUP/apt.log"; mkdir -p "$BACKUP"
-sudo -E apt-get update 2>&1 | tail -2
-
 # Сначала пробуем поставить всё одной командой — так быстрее и apt
 # сам разрулит зависимости. Если упадёт, разбираем по одному.
 MISSING=()
 echo "   Пакетов к установке: ${#PKGS[@]}. Полный лог: $LOG"
+# На Debian ставим ВСЁ одной командой с -t backports.
+# Иначе выходит так: Hyprland из backports тянет свежий libxkbcommon0,
+# а waybar и pipewire из main требуют старый — apt упирается в
+# «held broken packages» и они не встают. С -t apt подбирает
+# согласованный набор: что нужно берёт из backports, остальное из main.
+APT_T=()
 if [ "$DISTRO" = "debian" ] && [ -n "$CODENAME" ]; then
-    # эти шесть в main отсутствуют — просим apt взять их из backports
-    echo "   Debian: ставлю Hyprland из $CODENAME-backports"
-    sudo -E apt-get install -y -t "$CODENAME-backports" \
-        hyprland hypridle hyprlock hyprpaper hyprsunset xdg-desktop-portal-hyprland \
-        2>&1 | tee -a "$LOG" || warn "часть пакетов Hyprland не встала, смотри $LOG"
+    APT_T=(-t "$CODENAME-backports")
+    echo "   Debian: там, где нужно, беру версии из $CODENAME-backports"
 fi
 
 echo "   Это несколько минут. Ниже идёт вывод apt — так видно, что работа идёт."
-if sudo -E apt-get install -y "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
+if sudo -E apt-get install -y "${APT_T[@]}" "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
     ok "все ${#PKGS[@]} пакетов"
 else
     warn "пакетом не вышло, ставлю по одному (так видно, что именно ломается)"
     for p in "${PKGS[@]}"; do
         # пароль мог протухнуть за время долгой установки — спрашиваем видимо
         sudo -n true 2>/dev/null || { echo "   Нужен пароль sudo:"; sudo -v; }
-        if sudo -E apt-get install -y "$p" >>"$LOG" 2>&1; then
+        if sudo -E apt-get install -y "${APT_T[@]}" "$p" >>"$LOG" 2>&1; then
             ok "$p"
         else
             MISSING+=("$p"); warn "не встал: $p"
@@ -239,6 +256,62 @@ if [ -x "$SRC/security-tools.sh" ]; then
     else
         ok "пропускаю — поставить потом можно так: ./security-tools.sh"
     fi
+fi
+
+# ------------------------------------------------------- проверка результата
+# Раньше установщик мог отчитаться успехом, когда половина не встала:
+# apt писал «не встал: waybar» где-то в середине вывода, и всё.
+# Теперь в конце проверяем то, без чего рабочий стол не работает,
+# и если чего-то нет — говорим об этом громко и выходим с ошибкой.
+say "Проверяю, что получилось"
+BROKEN=()
+
+chk_cmd() {  # chk_cmd <команда> <зачем нужна>
+    if command -v "$1" >/dev/null 2>&1; then ok "$1"
+    else BROKEN+=("$1 — $2"); printf '\033[1;31m  ✗\033[0m %s — %s\n' "$1" "$2"; fi
+}
+chk_path() {
+    if [ -e "$1" ]; then ok "$2"
+    else BROKEN+=("$2"); printf '\033[1;31m  ✗\033[0m %s\n' "$2"; fi
+}
+
+chk_cmd Hyprland   "сам оконный менеджер"
+chk_cmd waybar     "панель сверху"
+chk_cmd kitty      "терминал"
+chk_cmd wofi       "меню запуска"
+chk_cmd hyprlock   "блокировка экрана"
+chk_cmd hyprpaper  "обои"
+chk_cmd wpctl      "управление звуком (wireplumber)"
+chk_cmd zsh        "оболочка, под неё написан .zshrc"
+
+chk_path "$HOME/.config/hypr/hyprland.conf" "конфиг Hyprland"
+chk_path "$HOME/.config/waybar/config.jsonc" "конфиг Waybar"
+chk_path "$HOME/.local/bin/wallpick"         "утилиты в ~/.local/bin"
+chk_path "$HOME/.zshrc"                      "настройки оболочки"
+chk_path /usr/share/wayland-sessions/hyprland.desktop "сессия Hyprland на экране входа"
+
+# менеджер входа: без него не будет сеанса logind, а значит ни мыши, ни клавиатуры
+if [ -e /etc/systemd/system/display-manager.service ]; then
+    ok "менеджер входа настроен"
+else
+    BROKEN+=("менеджер входа не настроен — в Hyprland не будет мыши и клавиатуры")
+    printf '\033[1;31m  ✗\033[0m менеджер входа не настроен\n'
+fi
+
+if [ ${#BROKEN[@]} -gt 0 ]; then
+    echo
+    printf '\033[1;31m╔══════════════════════════════════════════════════════╗\033[0m\n'
+    printf '\033[1;31m║  УСТАНОВКА НЕ ЗАВЕРШЕНА — не хватает вот этого:      ║\033[0m\n'
+    printf '\033[1;31m╚══════════════════════════════════════════════════════╝\033[0m\n'
+    for b in "${BROKEN[@]}"; do echo "   • $b"; done
+    echo
+    echo "   Что делать:"
+    echo "     1. Посмотри, что сказал apt:  tail -40 $LOG"
+    echo "     2. Запусти установщик ещё раз — готовое пропустится"
+    echo "     3. Если не поможет, покажи этот список и лог"
+    echo
+    [ ${#MISSING[@]} -gt 0 ] && echo "   Не установились пакеты: ${MISSING[*]}"
+    exit 1
 fi
 
 # ---------------------------------------------------------------- итог

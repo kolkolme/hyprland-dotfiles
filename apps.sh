@@ -152,10 +152,20 @@ fi
 
 update-desktop-database "$APPS" >/dev/null 2>&1 || true
 
-say "Программы: готово"
+say "Проверяю программы"
+for c in g++ code steam; do
+    command -v "$c" >/dev/null 2>&1 && ok "$c" \
+        || { printf '\033[1;31m  ✗\033[0m %s\n' "$c"; FAILED+=("$c"); }
+done
+[ -x "$OPT/Telegram/Telegram" ] && ok "Telegram" || { printf '\033[1;31m  ✗\033[0m Telegram\n'; FAILED+=("Telegram"); }
+[ -x "$OPT/Discord/discord" ]   && ok "Discord"  || { printf '\033[1;31m  ✗\033[0m Discord\n';  FAILED+=("Discord"); }
+
 if [ ${#FAILED[@]} -gt 0 ]; then
-    warn "не установились: ${FAILED[*]}"
+    echo
+    warn "НЕ УСТАНОВИЛИСЬ: ${FAILED[*]}"
     echo "     Подробности: $LOG"
     tail -12 "$LOG" 2>/dev/null | sed 's/^/       /'
     echo "     Запусти ./apps.sh ещё раз — уже поставленное пропустится."
+    exit 1
 fi
+say "Программы: все на месте"
