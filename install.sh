@@ -24,6 +24,29 @@ read -rp $'\nПродолжить? [y/N] ' a; [[ "$a" =~ ^[Yy]$ ]] || exit 0
 # ---------------------------------------------------------------- пакеты
 say "Ставлю пакеты"
 
+# ---- не занят ли apt ----
+# Если другой apt уже работает (обновление в фоне, открытый «Менеджер
+# приложений»), наш получит отказ по блокировке на каждом пакете и
+# отрапортует «не встал» семьдесят раз подряд. Причина при этом
+# потеряется среди вывода. Лучше сказать прямо и подождать.
+for i in $(seq 1 60); do
+    if sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+       || sudo lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+        [ "$i" = 1 ] && warn "apt сейчас занят другим процессом, жду освобождения..."
+        sleep 5
+    else
+        break
+    fi
+done
+if sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+    echo
+    warn "apt занят уже пять минут. Кто его держит:"
+    sudo fuser -v /var/lib/dpkg/lock-frontend 2>&1 | tail -3 | sed 's/^/     /'
+    echo "   Закрой менеджер приложений или дождись фонового обновления,"
+    echo "   потом запусти установщик заново."
+    exit 1
+fi
+
 # ---- какой это дистрибутив ----
 . /etc/os-release 2>/dev/null || true
 DISTRO="${ID:-unknown}"
@@ -116,14 +139,14 @@ if [ "$DISTRO" = "debian" ] && [ -n "$CODENAME" ]; then
 fi
 
 echo "   Это несколько минут. Ниже идёт вывод apt — так видно, что работа идёт."
-if sudo -E apt-get install -y "${APT_T[@]}" "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
+if sudo -E apt-get install -y --no-install-recommends "${APT_T[@]}" "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
     ok "все ${#PKGS[@]} пакетов"
 else
     warn "пакетом не вышло, ставлю по одному (так видно, что именно ломается)"
     for p in "${PKGS[@]}"; do
         # пароль мог протухнуть за время долгой установки — спрашиваем видимо
         sudo -n true 2>/dev/null || { echo "   Нужен пароль sudo:"; sudo -v; }
-        if sudo -E apt-get install -y "${APT_T[@]}" "$p" >>"$LOG" 2>&1; then
+        if sudo -E apt-get install -y --no-install-recommends "${APT_T[@]}" "$p" >>"$LOG" 2>&1; then
             ok "$p"
         else
             MISSING+=("$p"); warn "не встал: $p"

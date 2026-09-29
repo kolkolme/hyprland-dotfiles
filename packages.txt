@@ -1,6 +1,10 @@
 # Пакеты для сборки рабочего стола. Ставятся через install.sh.
 # Базовая система (libc6, bash, coreutils...) сюда намеренно не включена.
 
+# Пакеты ставятся с --no-install-recommends: иначе прилетает 250 МБ
+# шрифтов CJK и Noto-extra, которые рабочему столу не нужны.
+# Всё по-настоящему нужное из рекомендаций перечислено здесь явно.
+
 # --- Hyprland и компоненты ---
 hyprland
 hypridle
@@ -10,6 +14,9 @@ hyprsunset
 xdg-desktop-portal-hyprland
 xdg-desktop-portal-gtk
 qt6-wayland
+xwayland
+libcap2-bin
+polkitd
 
 # --- панель, меню, уведомления, выход ---
 waybar
@@ -42,7 +49,10 @@ playerctl
 
 # --- звук ---
 pipewire
+pipewire-pulse
+pipewire-audio
 wireplumber
+rtkit
 pavucontrol
 alsa-utils
 
@@ -72,6 +82,7 @@ nwg-look
 
 # --- нужно функциям и алиасам из shell/zshrc ---
 curl
+gnupg
 unzip
 unrar-free
 7zip

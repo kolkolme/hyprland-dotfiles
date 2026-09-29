@@ -7,6 +7,10 @@ say()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  •\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m [!]\033[0m %s\n' "$*"; }
 
+. /etc/os-release 2>/dev/null || true
+DISTRO="${ID:-unknown}"
+CODENAME="${VERSION_CODENAME:-}"
+
 # Никаких диалогов, ждущих ответа в тишине
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
@@ -50,21 +54,27 @@ say "VS Code"
 if command -v code >/dev/null 2>&1; then
     ok "уже стоит: $(code --version 2>/dev/null | head -1)"
 elif curl -fsSL https://packages.microsoft.com/keys/microsoft.asc -o "$TMP/ms.asc" 2>/dev/null; then
-    gpg --dearmor < "$TMP/ms.asc" > "$TMP/microsoft.gpg" 2>/dev/null
-    need_sudo && sudo install -D -o root -g root -m 644 "$TMP/microsoft.gpg" /etc/apt/keyrings/microsoft.gpg
+    # Без gpg: apt понимает ключ в текстовом виде, если файл .asc.
+    # В чистом Debian команды gpg просто нет, и раньше здесь молча
+    # получался пустой ключ, а репозиторий выходил неподписанным.
+    if [ ! -s "$TMP/ms.asc" ]; then
+        warn "ключ Microsoft скачался пустым"; FAILED+=("VS Code")
+    else
+    need_sudo && sudo install -D -o root -g root -m 644 "$TMP/ms.asc" /etc/apt/keyrings/microsoft.asc
     sudo tee /etc/apt/sources.list.d/vscode.sources >/dev/null <<'EOF'
 Types: deb
 URIs: https://packages.microsoft.com/repos/code
 Suites: stable
 Components: main
 Architectures: amd64
-Signed-By: /etc/apt/keyrings/microsoft.gpg
+Signed-By: /etc/apt/keyrings/microsoft.asc
 EOF
     need_sudo && sudo -E apt-get update 2>&1 | tail -2 | tee -a "$LOG"
     if apt_install code; then
         ok "поставлен из репозитория Microsoft"
     else
         warn "репозиторий добавлен, но пакет не встал"; FAILED+=("VS Code")
+    fi
     fi
 else
     warn "не скачался ключ Microsoft"; FAILED+=("VS Code")
@@ -88,7 +98,15 @@ else
     printf 'steam steam/question select I AGREE\nsteam steam/license note\n' \
         | sudo debconf-set-selections 2>/dev/null || true
     echo "   Steam тянет много 32-битных библиотек, это долго."
-    if apt_install steam-installer; then
+    # Hyprland уже притянул 64-битную Mesa из backports, а 32-битная
+    # по умолчанию берётся из main — версии не сходятся, и Steam не встаёт.
+    # Просим обе из backports.
+    STEAM_T=()
+    if [ "$DISTRO" = "debian" ]; then
+        [ -n "$CODENAME" ] && STEAM_T=(-t "$CODENAME-backports")
+    fi
+    need_sudo
+    if sudo -E apt-get install -y "${STEAM_T[@]}" steam-installer 2>&1 | tee -a "$LOG" >/dev/null; then
         ok "поставлен (докачает себя сам при первом запуске)"
     else
         warn "не удалось"; FAILED+=("Steam")
