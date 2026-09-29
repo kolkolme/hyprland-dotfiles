@@ -46,20 +46,42 @@ sudo -E apt-get update 2>&1 | tail -2
 MISSING=()
 echo "   Пакетов к установке: ${#PKGS[@]}. Полный лог: $LOG"
 echo "   Это несколько минут. Ниже идёт вывод apt — так видно, что работа идёт."
-if sudo -E apt-get install -y --no-install-recommends "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
+if sudo -E apt-get install -y "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
     ok "все ${#PKGS[@]} пакетов"
 else
     warn "пакетом не вышло, ставлю по одному (так видно, что именно ломается)"
     for p in "${PKGS[@]}"; do
         # пароль мог протухнуть за время долгой установки — спрашиваем видимо
         sudo -n true 2>/dev/null || { echo "   Нужен пароль sudo:"; sudo -v; }
-        if sudo -E apt-get install -y --no-install-recommends "$p" >>"$LOG" 2>&1; then
+        if sudo -E apt-get install -y "$p" >>"$LOG" 2>&1; then
             ok "$p"
         else
             MISSING+=("$p"); warn "не встал: $p"
         fi
     done
 fi
+
+# ------------------------------------------------------- сеанс и устройства
+# Hyprland сам не открывает /dev/input — он просит устройства у logind
+# по D-Bus, а тот отдаёт их только внутри активного сеанса на seat.
+# Без включённого менеджера входа такого сеанса нет, и в Hyprland
+# не работают ни мышь, ни клавиатура.
+say "Настраиваю вход в систему"
+if systemctl list-unit-files sddm.service >/dev/null 2>&1; then
+    sudo systemctl enable sddm >/dev/null 2>&1 && ok "sddm включён при загрузке"
+    sudo systemctl set-default graphical.target >/dev/null 2>&1 \
+        && ok "система будет грузиться в графику"
+else
+    warn "sddm не установлен — входить придётся из консоли"
+fi
+
+# Запасной путь: если сеанс logind почему-то не поднимется, прямой доступ
+# к устройствам даёт членство в группах.
+for g in input video render; do
+    getent group "$g" >/dev/null 2>&1 || continue
+    id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$g" && continue
+    sudo usermod -aG "$g" "$USER" && ok "добавил тебя в группу $g"
+done
 
 # ---------------------------------------------------------------- конфиги
 say "Раскладываю конфиги в ~/.config"
@@ -150,7 +172,10 @@ fi
 cat <<'EOT'
 
 Дальше:
-  1. Выйди из сессии и зайди снова, выбрав Hyprland.
+  1. ПЕРЕЗАГРУЗИСЬ. Не просто выйди из сессии — нужен новый вход,
+     иначе не подхватятся группы и не поднимется сеанс logind.
+     После перезагрузки на экране входа выбери сессию Hyprland
+     (переключатель обычно в левом верхнем углу).
   2. Hyprland: Super+Q — терминал, Super+R — меню. Полный список биндов: hypr-help
   3. Обои и цвета системы:  wallpick
      Он генерирует палитру waybar/wofi/kitty из выбранных обоев.
