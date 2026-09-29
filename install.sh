@@ -39,17 +39,20 @@ echo "sddm shared/default-x-display-manager select sddm" | sudo debconf-set-sele
 
 mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "$SRC/packages.txt")
 LOG="$BACKUP/apt.log"; mkdir -p "$BACKUP"
-sudo apt-get update 2>&1 | tail -2
+sudo -E apt-get update 2>&1 | tail -2
 
 # Сначала пробуем поставить всё одной командой — так быстрее и apt
 # сам разрулит зависимости. Если упадёт, разбираем по одному.
 MISSING=()
-echo "   Ставлю ${#PKGS[@]} пакетов одной командой, подробности в $LOG"
-if sudo -E apt-get install -y --no-install-recommends "${PKGS[@]}" >>"$LOG" 2>&1; then
+echo "   Пакетов к установке: ${#PKGS[@]}. Полный лог: $LOG"
+echo "   Это несколько минут. Ниже идёт вывод apt — так видно, что работа идёт."
+if sudo -E apt-get install -y --no-install-recommends "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
     ok "все ${#PKGS[@]} пакетов"
 else
     warn "пакетом не вышло, ставлю по одному (так видно, что именно ломается)"
     for p in "${PKGS[@]}"; do
+        # пароль мог протухнуть за время долгой установки — спрашиваем видимо
+        sudo -n true 2>/dev/null || { echo "   Нужен пароль sudo:"; sudo -v; }
         if sudo -E apt-get install -y --no-install-recommends "$p" >>"$LOG" 2>&1; then
             ok "$p"
         else
