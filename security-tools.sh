@@ -13,6 +13,7 @@ warn() { printf '\033[1;33m [!]\033[0m %s\n' "$*"; }
 
 . /etc/os-release 2>/dev/null || true
 DISTRO="${ID:-unknown}"
+CODENAME="${VERSION_CODENAME:-}"
 OPT="$HOME/.local/opt"; BIN="$HOME/.local/bin"
 mkdir -p "$OPT" "$BIN"
 LOG="$HOME/.dotfiles-security.log"; : > "$LOG"

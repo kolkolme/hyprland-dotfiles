@@ -15,13 +15,26 @@ ok()   { printf '\033[1;32m  •\033[0m %s\n' "$*"; }
 [ "$(id -u)" -eq 0 ] && { echo "Не запускай от root — запусти от своего пользователя."; exit 1; }
 command -v apt-get >/dev/null || { echo "Нужен apt (Debian/Kali/Ubuntu)."; exit 1; }
 
+# Вопросы читаем с терминала, а не со stdin: apt внутри установки
+# способен подъесть стандартный ввод, и тогда вопрос остаётся без
+# ответа, хотя человек сидит за клавиатурой.
+ask() {   # ask <переменная> <текст>
+    local __v="$1"; shift
+    eval "$__v=''"
+    if [ -r /dev/tty ]; then
+        read -rp "$*" "$__v" < /dev/tty || true
+    else
+        read -rp "$*" "$__v" || true
+    fi
+}
+
 say "Установка рабочего стола из $SRC"
 echo "   Пользователь: $USER"
 echo "   Домашняя:     $HOME"
 echo "   Бэкап старых конфигов уйдёт в: $BACKUP"
 # read возвращает 1, когда ввод закончился, и при set -e это убивает
 # скрипт молча, прямо на вопросе. || true обязателен у каждого вопроса.
-a=""; read -rp $'\nПродолжить? [y/N] ' a || true
+ask a $'\nПродолжить? [y/N] '
 [[ "$a" =~ ^[Yy]$ ]] || exit 0
 
 # ---------------------------------------------------------------- пакеты
@@ -250,7 +263,7 @@ ok ".zshrc — алиасы, функции, starship, fastfetch"
 
 if [ "$(getent passwd "$USER" | cut -d: -f7)" != "$(command -v zsh)" ]; then
     warn "Оболочка по умолчанию — не zsh."
-    z=""; read -rp "     Сделать zsh основной? [y/N] " z || true
+    ask z "     Сделать zsh основной? [y/N] "
     if [[ "$z" =~ ^[Yy]$ ]]; then
         chsh -s "$(command -v zsh)" && ok "готово, применится при следующем входе"
     else
@@ -309,7 +322,7 @@ if [ -x "$SRC/security-tools.sh" ]; then
     say "Инструменты безопасности из набора Kali"
     echo "   nmap, wireshark, metasploit, sqlmap, hashcat, SecLists и прочее."
     echo "   Займёт несколько гигабайт (одни словари SecLists около 1 ГБ)."
-    st=""; read -rp "   Поставить? [y/N] " st || true
+    ask st "   Поставить? [y/N] "
     if [[ "$st" =~ ^[Yy]$ ]]; then
         "$SRC/security-tools.sh" || { SUBFAIL+=("инструменты безопасности (security-tools.sh)"); warn "security-tools.sh отработал с ошибкой, продолжаю"; }
     else
