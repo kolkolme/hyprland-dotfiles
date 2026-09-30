@@ -21,7 +21,9 @@ command -v apt-get >/dev/null || { echo "Нужен apt (Debian/Kali/Ubuntu)."; 
 ask() {   # ask <переменная> <текст>
     local __v="$1"; shift
     eval "$__v=''"
-    if [ -r /dev/tty ]; then
+    # проверяем не наличие /dev/tty, а что его реально можно открыть:
+    # в фоне или под другим процессом узел есть, а открыть его нельзя
+    if ( : < /dev/tty ) 2>/dev/null; then
         read -rp "$*" "$__v" < /dev/tty || true
     else
         read -rp "$*" "$__v" || true
