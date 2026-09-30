@@ -19,7 +19,10 @@ say "Установка рабочего стола из $SRC"
 echo "   Пользователь: $USER"
 echo "   Домашняя:     $HOME"
 echo "   Бэкап старых конфигов уйдёт в: $BACKUP"
-read -rp $'\nПродолжить? [y/N] ' a; [[ "$a" =~ ^[Yy]$ ]] || exit 0
+# read возвращает 1, когда ввод закончился, и при set -e это убивает
+# скрипт молча, прямо на вопросе. || true обязателен у каждого вопроса.
+a=""; read -rp $'\nПродолжить? [y/N] ' a || true
+[[ "$a" =~ ^[Yy]$ ]] || exit 0
 
 # ---------------------------------------------------------------- пакеты
 say "Ставлю пакеты"
@@ -247,7 +250,7 @@ ok ".zshrc — алиасы, функции, starship, fastfetch"
 
 if [ "$(getent passwd "$USER" | cut -d: -f7)" != "$(command -v zsh)" ]; then
     warn "Оболочка по умолчанию — не zsh."
-    read -rp "     Сделать zsh основной? [y/N] " z
+    z=""; read -rp "     Сделать zsh основной? [y/N] " z || true
     if [[ "$z" =~ ^[Yy]$ ]]; then
         chsh -s "$(command -v zsh)" && ok "готово, применится при следующем входе"
     else
@@ -306,7 +309,7 @@ if [ -x "$SRC/security-tools.sh" ]; then
     say "Инструменты безопасности из набора Kali"
     echo "   nmap, wireshark, metasploit, sqlmap, hashcat, SecLists и прочее."
     echo "   Займёт несколько гигабайт (одни словари SecLists около 1 ГБ)."
-    read -rp "   Поставить? [y/N] " st
+    st=""; read -rp "   Поставить? [y/N] " st || true
     if [[ "$st" =~ ^[Yy]$ ]]; then
         "$SRC/security-tools.sh" || { SUBFAIL+=("инструменты безопасности (security-tools.sh)"); warn "security-tools.sh отработал с ошибкой, продолжаю"; }
     else
