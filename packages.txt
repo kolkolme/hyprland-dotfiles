@@ -93,6 +93,22 @@ cmatrix
 pipes-sh
 tty-clock
 
+# --- видеокарта: прошивки и драйверы ---
+# Без них Hyprland рисует программно, через процессор: окна открываются
+# рывками, блюр и тени подвешивают систему. На Kali это приходит из
+# kali-linux-firmware, в чистом Debian надо ставить явно.
+# Требуют компонент non-free-firmware в sources.list.
+firmware-linux
+firmware-intel-graphics
+firmware-amd-graphics
+firmware-sof-signed
+libgl1-mesa-dri
+mesa-vulkan-drivers
+mesa-va-drivers
+intel-media-va-driver
+mesa-utils
+vainfo
+
 # --- питание и датчики (ноутбук) ---
 tlp
 thermald

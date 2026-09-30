@@ -212,7 +212,37 @@ CUR_DM=""
 # именно -e, а не readlink: для несуществующего пути readlink -f
 # возвращает сам путь, и basename дал бы мнимое имя службы
 [ -e "$DM_LINK" ] && CUR_DM="$(basename "$(readlink -f "$DM_LINK")" .service)"
-if [ -n "$CUR_DM" ]; then
+# GDM прячет ВСЕ сессии Wayland, если видит проприетарный драйвер NVIDIA:
+# он уходит в режим X11, и Hyprland пропадает из списка на экране входа.
+HAS_NVIDIA=0
+lspci 2>/dev/null | grep -qiE 'vga|3d|display' && \
+    lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -qi nvidia && HAS_NVIDIA=1
+
+if [ "$CUR_DM" = "gdm3" ] && [ "$HAS_NVIDIA" = 1 ]; then
+    warn "менеджер входа — gdm3, и найдена видеокарта NVIDIA"
+    warn "gdm3 в этом случае скрывает все сессии Wayland, включая Hyprland"
+    if systemctl list-unit-files sddm.service >/dev/null 2>&1; then
+        echo "   Переключаю на sddm. GNOME останется, его можно будет выбрать там же."
+        sudo systemctl disable gdm3 >/dev/null 2>&1 || true
+        sudo systemctl enable sddm >/dev/null 2>&1 \
+            && ok "sddm включён вместо gdm3" || warn "не удалось включить sddm"
+    else
+        warn "sddm не установлен — Hyprland из gdm3 не появится в списке"
+    fi
+elif [ "$CUR_DM" = "lightdm" ]; then
+    # lightdm не умеет запускать сессии Wayland: Hyprland либо не появится
+    # в списке, либо не стартует. Нужен sddm или gdm3.
+    warn "менеджер входа — lightdm, а он не запускает сессии Wayland"
+    if systemctl list-unit-files sddm.service >/dev/null 2>&1; then
+        echo "   Переключаю на sddm (lightdm останется установленным)."
+        sudo systemctl disable lightdm >/dev/null 2>&1 || true
+        sudo systemctl enable sddm >/dev/null 2>&1 \
+            && ok "sddm включён вместо lightdm" \
+            || warn "не удалось включить sddm"
+    else
+        warn "sddm не установлен — Hyprland из lightdm не запустится"
+    fi
+elif [ -n "$CUR_DM" ]; then
     sudo systemctl enable "$CUR_DM" >/dev/null 2>&1 \
         && ok "менеджер входа уже настроен ($CUR_DM), включил его"
 elif systemctl list-unit-files sddm.service >/dev/null 2>&1; then
@@ -361,6 +391,19 @@ chk_path "$HOME/.config/waybar/config.jsonc" "конфиг Waybar"
 chk_path "$HOME/.local/bin/wallpick"         "утилиты в ~/.local/bin"
 chk_path "$HOME/.zshrc"                      "настройки оболочки"
 chk_path /usr/share/wayland-sessions/hyprland.desktop "сессия Hyprland на экране входа"
+
+# аппаратное ускорение: без него Hyprland рисует через процессор и всё тормозит
+if command -v glxinfo >/dev/null 2>&1; then
+    REND="$(glxinfo -B 2>/dev/null | grep -m1 -i 'renderer string' || true)"
+    case "$REND" in
+        *llvmpipe*|*softpipe*|*swrast*)
+            warn "видеокарта работает без ускорения (программный рендер)"
+            warn "окна будут открываться рывками. Проверь, встали ли прошивки:"
+            warn "  dmesg | grep -i firmware | grep -i fail" ;;
+        "") : ;;
+        *) ok "аппаратное ускорение: ${REND#*: }" ;;
+    esac
+fi
 
 # менеджер входа: без него не будет сеанса logind, а значит ни мыши, ни клавиатуры
 if [ -e /etc/systemd/system/display-manager.service ]; then
