@@ -24,6 +24,30 @@ read -rp $'\nПродолжить? [y/N] ' a; [[ "$a" =~ ^[Yy]$ ]] || exit 0
 # ---------------------------------------------------------------- пакеты
 say "Ставлю пакеты"
 
+# ---- доступны ли репозитории по HTTP ----
+# В некоторых сетях порт 80 закрыт, а в sources.list у Debian по умолчанию
+# именно http://. Тогда apt не может скачать ни одного пакета, а сообщение
+# «Unable to connect ... :http» теряется среди сотен строк вывода.
+# Проверяем заранее и при необходимости переключаем на HTTPS.
+MIRROR_HOST="$(grep -rhoE '^[^#]*https?://[^/ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null \
+    | grep -oE 'https?://[^/ ]+' | head -1)"
+if [ -n "$MIRROR_HOST" ] && [ "${MIRROR_HOST#http://}" != "$MIRROR_HOST" ]; then
+    H="${MIRROR_HOST#http://}"
+    if ! timeout 10 bash -c "echo > /dev/tcp/$H/80" 2>/dev/null; then
+        warn "порт 80 закрыт — apt по HTTP работать не сможет"
+        if timeout 10 bash -c "echo > /dev/tcp/$H/443" 2>/dev/null; then
+            echo "   HTTPS доступен. Переключаю репозитории на него."
+            sudo sed -i 's|http://|https://|g' /etc/apt/sources.list 2>/dev/null || true
+            for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+                [ -f "$f" ] && sudo sed -i 's|http://|https://|g' "$f" 2>/dev/null || true
+            done
+            ok "репозитории переведены на HTTPS"
+        else
+            warn "и HTTPS недоступен — проверь интернет или прокси"
+        fi
+    fi
+fi
+
 # ---- не занят ли apt ----
 # Если другой apt уже работает (обновление в фоне, открытый «Менеджер
 # приложений»), наш получит отказ по блокировке на каждом пакете и
@@ -139,14 +163,14 @@ if [ "$DISTRO" = "debian" ] && [ -n "$CODENAME" ]; then
 fi
 
 echo "   Это несколько минут. Ниже идёт вывод apt — так видно, что работа идёт."
-if sudo -E apt-get install -y --no-install-recommends "${APT_T[@]}" "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
+if sudo -E apt-get install -q -y --no-install-recommends "${APT_T[@]}" "${PKGS[@]}" 2>&1 | tee -a "$LOG"; then
     ok "все ${#PKGS[@]} пакетов"
 else
     warn "пакетом не вышло, ставлю по одному (так видно, что именно ломается)"
     for p in "${PKGS[@]}"; do
         # пароль мог протухнуть за время долгой установки — спрашиваем видимо
         sudo -n true 2>/dev/null || { echo "   Нужен пароль sudo:"; sudo -v; }
-        if sudo -E apt-get install -y --no-install-recommends "${APT_T[@]}" "$p" >>"$LOG" 2>&1; then
+        if sudo -E apt-get install -q -y --no-install-recommends "${APT_T[@]}" "$p" >>"$LOG" 2>&1; then
             ok "$p"
         else
             MISSING+=("$p"); warn "не встал: $p"

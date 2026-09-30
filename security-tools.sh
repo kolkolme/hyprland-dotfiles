@@ -20,6 +20,15 @@ export DEBIAN_FRONTEND=noninteractive
 FAILED=()      # то, без чего набор считается несобранным
 OPTIONAL=()    # необязательное: недоступно на этом дистрибутиве или не собралось
 
+# На Debian часть системы уже стоит из backports (её тянет Hyprland).
+# Если доставлять остальное без -t backports, apt берёт версии из main,
+# они требуют старые библиотеки и всё упирается в held broken packages.
+APT_T=()
+if [ "$DISTRO" = "debian" ] && [ -n "$CODENAME" ]; then
+    APT_T=(-t "$CODENAME-backports")
+fi
+
+
 # При set -o pipefail конструкция `cmd | grep -q` ложно падает:
 # grep -q закрывает канал по первому совпадению, cmd получает SIGPIPE,
 # и весь конвейер считается упавшим, хотя совпадение было.
@@ -43,7 +52,7 @@ apt_some() {
     done
     [ ${#avail[@]} -eq 0 ] && return 1
     need_sudo || return 1
-    sudo -E apt-get install -y "${avail[@]}" 2>&1 | tee -a "$LOG" >/dev/null
+    sudo -E apt-get install -q -y "${APT_T[@]}" "${avail[@]}" 2>&1 | tee -a "$LOG" >/dev/null
     ok "из репозиториев: ${avail[*]}"
 }
 
@@ -83,7 +92,7 @@ warn "репозитории Kali НЕ подключаю — они ломаю�
 
 # netexec собирает нативные расширения: нужны заголовки Python и Rust,
 # иначе pipx падает на "Python.h: No such file" и "can't find Rust compiler"
-need_sudo && sudo -E apt-get install -y git curl pipx ruby ruby-dev build-essential \
+need_sudo && sudo -E apt-get install -q -y "${APT_T[@]}" git curl pipx ruby ruby-dev build-essential \
     python3-dev libffi-dev libssl-dev pkg-config rustc cargo \
     perl libwww-perl libnet-ssleay-perl >>"$LOG" 2>&1
 pipx ensurepath >>"$LOG" 2>&1 || true

@@ -26,10 +26,18 @@ need_sudo() {
     sudo -v
 }
 
+# На Debian часть системы уже стоит из backports (её тянет Hyprland).
+# Если доставлять остальное без -t backports, apt берёт версии из main,
+# они требуют старые библиотеки и всё упирается в held broken packages.
+APT_T=()
+if [ "$DISTRO" = "debian" ] && [ -n "$CODENAME" ]; then
+    APT_T=(-t "$CODENAME-backports")
+fi
+
 # apt печатает и в терминал, и в лог. Ничего невидимого больше нет.
 apt_install() {
     need_sudo || return 1
-    sudo -E apt-get install -y --no-install-recommends "$@" 2>&1 | tee -a "$LOG"
+    sudo -E apt-get install -q -y --no-install-recommends "${APT_T[@]}" "$@" 2>&1 | tee -a "$LOG"
 }
 
 OPT="$HOME/.local/opt"
@@ -101,12 +109,8 @@ else
     # Hyprland уже притянул 64-битную Mesa из backports, а 32-битная
     # по умолчанию берётся из main — версии не сходятся, и Steam не встаёт.
     # Просим обе из backports.
-    STEAM_T=()
-    if [ "$DISTRO" = "debian" ]; then
-        [ -n "$CODENAME" ] && STEAM_T=(-t "$CODENAME-backports")
-    fi
     need_sudo
-    if sudo -E apt-get install -y "${STEAM_T[@]}" steam-installer 2>&1 | tee -a "$LOG" >/dev/null; then
+    if sudo -E apt-get install -q -y "${APT_T[@]}" steam-installer 2>&1 | tee -a "$LOG" >/dev/null; then
         ok "поставлен (докачает себя сам при первом запуске)"
     else
         warn "не удалось"; FAILED+=("Steam")
