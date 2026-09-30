@@ -29,8 +29,12 @@ say "Ставлю пакеты"
 # именно http://. Тогда apt не может скачать ни одного пакета, а сообщение
 # «Unable to connect ... :http» теряется среди сотен строк вывода.
 # Проверяем заранее и при необходимости переключаем на HTTPS.
-MIRROR_HOST="$(grep -rhoE '^[^#]*https?://[^/ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null \
-    | grep -oE 'https?://[^/ ]+' | head -1)"
+# || true обязателен: при set -e неудача подстановки убивает скрипт,
+# а grep возвращает ненулевой код и когда ничего не нашёл, и когда
+# шаблон *.list ни на что не раскрылся. Плюс head закрывает канал,
+# и grep получает SIGPIPE, что при pipefail тоже считается провалом.
+MIRROR_HOST="$(grep -rhoE 'https?://[^/ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+    | head -1 || true)"
 if [ -n "$MIRROR_HOST" ] && [ "${MIRROR_HOST#http://}" != "$MIRROR_HOST" ]; then
     H="${MIRROR_HOST#http://}"
     if ! timeout 10 bash -c "echo > /dev/tcp/$H/80" 2>/dev/null; then
