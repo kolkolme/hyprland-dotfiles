@@ -132,8 +132,6 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-# sddm спрашивает, какой менеджер входа сделать основным — отвечаем заранее
-echo "sddm shared/default-x-display-manager select sddm" | sudo debconf-set-selections 2>/dev/null || true
 
 LOG="$BACKUP/apt.log"; mkdir -p "$BACKUP"
 
@@ -204,56 +202,59 @@ fi
 # Без включённого менеджера входа такого сеанса нет, и в Hyprland
 # не работают ни мышь, ни клавиатура.
 say "Настраиваю вход в систему"
-# Если менеджер входа уже настроен (в Kali часто lightdm) — не трогаем его:
-# два включённых менеджера дерутся за экран. Нам важно лишь, чтобы
-# хоть какой-то был включён, иначе не будет сеанса logind.
+# Правило: если менеджер входа уже есть — НЕ ТРОГАЕМ. Ни enable, ни
+# disable, ни debconf. На Debian у gdm нет секции [Install], systemctl
+# enable/disable с ним не работает, а попытка переключить вслепую
+# оставила живую систему без экрана входа. Решение принимает человек:
+# скрипт только объясняет, что и почему может не заработать.
 DM_LINK=/etc/systemd/system/display-manager.service
 CUR_DM=""
-# именно -e, а не readlink: для несуществующего пути readlink -f
-# возвращает сам путь, и basename дал бы мнимое имя службы
 [ -e "$DM_LINK" ] && CUR_DM="$(basename "$(readlink -f "$DM_LINK")" .service)"
-# GDM прячет ВСЕ сессии Wayland, если видит проприетарный драйвер NVIDIA:
-# он уходит в режим X11, и Hyprland пропадает из списка на экране входа.
-HAS_NVIDIA=0
-lspci 2>/dev/null | grep -qiE 'vga|3d|display' && \
-    lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -qi nvidia && HAS_NVIDIA=1
 
-# В Debian пакет называется gdm3, а служба — gdm. Проверяем оба имени.
-if { [ "$CUR_DM" = "gdm3" ] || [ "$CUR_DM" = "gdm" ]; } && [ "$HAS_NVIDIA" = 1 ]; then
-    warn "менеджер входа — gdm3, и найдена видеокарта NVIDIA"
-    warn "gdm3 в этом случае скрывает все сессии Wayland, включая Hyprland"
-    if systemctl list-unit-files sddm.service >/dev/null 2>&1; then
-        echo "   Переключаю на sddm. GNOME останется, его можно будет выбрать там же."
-        sudo systemctl disable "$CUR_DM" >/dev/null 2>&1 || true
-        sudo systemctl enable sddm >/dev/null 2>&1 \
-            && ok "sddm включён вместо $CUR_DM" || warn "не удалось включить sddm"
-    else
-        warn "sddm не установлен — Hyprland из $CUR_DM не появится в списке"
-    fi
-elif [ "$CUR_DM" = "lightdm" ]; then
-    # lightdm не умеет запускать сессии Wayland: Hyprland либо не появится
-    # в списке, либо не стартует. Нужен sddm или gdm3.
-    warn "менеджер входа — lightdm, а он не запускает сессии Wayland"
-    if systemctl list-unit-files sddm.service >/dev/null 2>&1; then
-        echo "   Переключаю на sddm (lightdm останется установленным)."
-        sudo systemctl disable lightdm >/dev/null 2>&1 || true
-        sudo systemctl enable sddm >/dev/null 2>&1 \
-            && ok "sddm включён вместо lightdm" \
-            || warn "не удалось включить sddm"
-    else
-        warn "sddm не установлен — Hyprland из lightdm не запустится"
-    fi
-elif [ -n "$CUR_DM" ]; then
-    sudo systemctl enable "$CUR_DM" >/dev/null 2>&1 \
-        && ok "менеджер входа уже настроен ($CUR_DM), включил его"
-elif systemctl list-unit-files sddm.service >/dev/null 2>&1; then
-    sudo systemctl enable sddm >/dev/null 2>&1 && ok "sddm включён при загрузке"
+HAS_NVIDIA=0
+lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -qi nvidia && HAS_NVIDIA=1 || true
+
+if [ -n "$CUR_DM" ]; then
+    ok "менеджер входа уже настроен: $CUR_DM — оставляю как есть"
+    case "$CUR_DM" in
+        lightdm)
+            warn "lightdm не запускает сессии Wayland: Hyprland из него не стартует"
+            echo "   Проверить Hyprland можно без смены менеджера: Ctrl+Alt+F3, войти, набрать Hyprland."
+            echo "   Если захочешь sddm вместо lightdm — только вручную и осознанно:"
+            echo "     sudo apt install sddm && sudo dpkg-reconfigure sddm   (выбрать sddm)"
+            ;;
+        gdm|gdm3)
+            if [ "$HAS_NVIDIA" = 1 ]; then
+                warn "gdm с драйвером NVIDIA может прятать сессии Wayland, в том числе Hyprland"
+                echo "   Сначала проверь без смены менеджера: Ctrl+Alt+F3, войти, набрать Hyprland."
+                echo "   Ctrl+Alt+F2 вернёт в GNOME. Менять менеджер входа — только вручную."
+            fi
+            ;;
+    esac
 else
-    warn "менеджера входа нет — Hyprland придётся запускать из консоли,"
-    warn "и тогда мышь с клавиатурой могут не заработать"
+    # менеджера нет вовсе (чистый Debian без рабочего стола): без него не
+    # будет сеанса logind, а значит в Hyprland не заработают мышь и клавиатура
+    echo "   Менеджер входа не настроен — ставлю sddm."
+    echo "sddm shared/default-x-display-manager select sddm" | sudo debconf-set-selections 2>/dev/null || true
+    if sudo -E apt-get install -q -y --no-install-recommends "${APT_T[@]}" sddm >>"$LOG" 2>&1; then
+        # пакет сам прописывает display-manager.service и default-display-manager;
+        # проверяем и при необходимости делаем это по-дебиановски, без systemctl enable
+        if [ ! -e "$DM_LINK" ]; then
+            SDDM_UNIT="$(ls /usr/lib/systemd/system/sddm.service /lib/systemd/system/sddm.service 2>/dev/null | head -1 || true)"
+            [ -n "$SDDM_UNIT" ] && sudo ln -sf "$SDDM_UNIT" "$DM_LINK"
+            echo /usr/bin/sddm | sudo tee /etc/X11/default-display-manager >/dev/null
+        fi
+        [ -e "$DM_LINK" ] && ok "sddm установлен и назначен менеджером входа" \
+                          || warn "sddm поставлен, но менеджер входа не назначился — смотри $LOG"
+    else
+        warn "sddm не установился — Hyprland придётся запускать из консоли,"
+        warn "и тогда мышь с клавиатурой могут не заработать"
+    fi
 fi
-sudo systemctl set-default graphical.target >/dev/null 2>&1 \
-    && ok "система будет грузиться в графику"
+if [ -e "$DM_LINK" ]; then
+    sudo systemctl set-default graphical.target >/dev/null 2>&1 \
+        && ok "система будет грузиться в графику"
+fi
 
 # Запасной путь: если сеанс logind почему-то не поднимется, прямой доступ
 # к устройствам даёт членство в группах.
