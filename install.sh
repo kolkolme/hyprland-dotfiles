@@ -218,16 +218,17 @@ HAS_NVIDIA=0
 lspci 2>/dev/null | grep -qiE 'vga|3d|display' && \
     lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -qi nvidia && HAS_NVIDIA=1
 
-if [ "$CUR_DM" = "gdm3" ] && [ "$HAS_NVIDIA" = 1 ]; then
+# В Debian пакет называется gdm3, а служба — gdm. Проверяем оба имени.
+if { [ "$CUR_DM" = "gdm3" ] || [ "$CUR_DM" = "gdm" ]; } && [ "$HAS_NVIDIA" = 1 ]; then
     warn "менеджер входа — gdm3, и найдена видеокарта NVIDIA"
     warn "gdm3 в этом случае скрывает все сессии Wayland, включая Hyprland"
     if systemctl list-unit-files sddm.service >/dev/null 2>&1; then
         echo "   Переключаю на sddm. GNOME останется, его можно будет выбрать там же."
-        sudo systemctl disable gdm3 >/dev/null 2>&1 || true
+        sudo systemctl disable "$CUR_DM" >/dev/null 2>&1 || true
         sudo systemctl enable sddm >/dev/null 2>&1 \
-            && ok "sddm включён вместо gdm3" || warn "не удалось включить sddm"
+            && ok "sddm включён вместо $CUR_DM" || warn "не удалось включить sddm"
     else
-        warn "sddm не установлен — Hyprland из gdm3 не появится в списке"
+        warn "sddm не установлен — Hyprland из $CUR_DM не появится в списке"
     fi
 elif [ "$CUR_DM" = "lightdm" ]; then
     # lightdm не умеет запускать сессии Wayland: Hyprland либо не появится
